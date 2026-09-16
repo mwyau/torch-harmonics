@@ -39,6 +39,86 @@ from torch_harmonics.truncation import truncate_sht
 from torch_harmonics.utils import check
 
 
+def _periodic_latitude_extension(x: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
+    r"""Extend ``(..., m, nlat)`` data to a periodic meridian.
+
+    The caller supplies the continuation signs, for example
+    :math:`(-1)^m` for scalar modes and :math:`(-1)^{m+1}` for tangential
+    vector components. The two poles occur once in the returned sequence; only
+    the interior latitude rings are reversed. ``signs`` has shape ``(m, 1)``
+    and is broadcast over leading dimensions. It may be a floating-point or
+    integer tensor; multiplication preserves the complex dtype of ``x``.
+    """
+
+    interior_reversed = x[..., 1:-1].flip(-1)
+    return torch.cat((x, signs * interior_reversed), dim=-1)
+
+
+def _fourier_upsample_latitude(x: torch.Tensor, target_length: int) -> torch.Tensor:
+    """Interpolate periodic data by centered Fourier zero-padding.
+
+    The input FFT uses forward normalization, so its entries are Fourier-series
+    amplitudes. The inverse FFT uses the matching forward convention and does
+    not require a separate length ratio. For an even input length, the single
+    Nyquist coefficient is kept once at its negative-frequency representative;
+    after upsampling it remains at frequency ``-N/2`` rather than being
+    duplicated at the positive representative.
+    """
+
+    input_length = x.shape[-1]
+    if target_length < input_length:
+        raise ValueError(f"target_length must be at least the input length, got {target_length} < {input_length}")
+    if target_length == input_length:
+        return x
+
+    spectrum = torch.fft.fft(x, dim=-1, norm="forward")
+    spectrum = torch.fft.fftshift(spectrum, dim=-1)
+
+    pad_left = (target_length - input_length) // 2
+    pad_right = target_length - input_length - pad_left
+    left = torch.zeros(*spectrum.shape[:-1], pad_left, dtype=spectrum.dtype, device=spectrum.device)
+    right = torch.zeros(*spectrum.shape[:-1], pad_right, dtype=spectrum.dtype, device=spectrum.device)
+    spectrum = torch.cat((left, spectrum, right), dim=-1)
+
+    spectrum = torch.fft.ifftshift(spectrum, dim=-1)
+    return torch.fft.ifft(spectrum, dim=-1, norm="forward")
+
+
+def _adjust_equiangular_mmax(nlat, nlon, lmax, mmax, grid):
+    """Adjust an omitted equiangular order limit for an explicit high degree."""
+
+    direct_lmax = (nlat + 1) // 2 if grid == "equiangular" else None
+    if grid == "equiangular" and lmax is not None and lmax > direct_lmax and mmax is None:
+        return (nlon - 1) // 2 + 1
+    return mmax
+
+
+def _resolve_sht_limits(nlat, nlon, lmax, mmax, grid):
+    """Resolve upstream triangular limits and select equiangular upsampling."""
+
+    direct_lmax = (nlat + 1) // 2 if grid == "equiangular" else None
+
+    # An explicit high degree with no order limit should use the recoverable
+    # longitude bandwidth before the upstream triangular truncation is applied.
+    # All other calls retain the exact upstream arguments and defaults.
+    mmax = _adjust_equiangular_mmax(nlat, nlon, lmax, mmax, grid)
+
+    lmax, mmax = truncate_sht(nlat, nlon, lmax, mmax, grid)
+    high_bandwidth = grid == "equiangular" and lmax > direct_lmax
+
+    if high_bandwidth:
+        max_lmax = nlat - 1
+        max_mmax = (nlon - 1) // 2 + 1
+        if lmax > max_lmax or mmax > max_mmax:
+            raise ValueError(
+                f"High-bandwidth equiangular SHT on a {nlat}x{nlon} grid supports "
+                f"exclusive lmax <= {max_lmax} and mmax <= {max_mmax}; "
+                f"resolved limits were ({lmax}, {mmax})"
+            )
+
+    return lmax, mmax, high_bandwidth
+
+
 class RealSHT(nn.Module):
     r"""
     Defines a module for computing the forward (real-valued) SHT.
@@ -56,6 +136,12 @@ class RealSHT(nn.Module):
 
     where :math:`\tilde{f}_m` are the Fourier modes and :math:`q_k` are the
     quadrature weights.
+
+    On the pole-including equiangular grid, omitted limits retain the
+    conservative direct-quadrature default.  When an explicit ``lmax`` requests
+    a higher supported degree, the forward transform internally reconstructs a
+    denser meridional grid before applying Clenshaw--Curtis quadrature, allowing
+    recovery up to the grid's safe high-bandwidth limits.
 
     .. seealso::
         :doc:`/guide/spherical_harmonic_transforms`
@@ -96,9 +182,13 @@ class RealSHT(nn.Module):
     .. note::
         This module uses **cuFFT** (via :func:`torch.fft.rfft`) to compute the
         longitudinal Fourier transform efficiently.  When running in **float16** or
-        **bfloat16** precision, cuFFT requires the transformed dimension (``nlon``)
-        to be a **power of two**.  If your grid does not satisfy this constraint and
-        the module is called inside a :class:`torch.autocast` context, guard it with
+        **bfloat16** precision, cuFFT requires transformed dimensions to satisfy
+        backend-specific size restrictions.  The direct path transforms ``nlon``;
+        an explicitly requested high-bandwidth equiangular transform additionally
+        transforms theta lengths ``2 * (nlat - 1)`` and ``4 * (nlat - 1)``.  The
+        The high-bandwidth path is validated for float32 and float64.  If a grid does
+        not satisfy these constraints and the module is called inside a
+        :class:`torch.autocast` context, guard it with
         ``torch.autocast(device_type="cuda", enabled=False)``::
 
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -121,10 +211,17 @@ class RealSHT(nn.Module):
         self.norm = norm
         self.csphase = csphase
 
+        # Resolve once, preserving upstream triangular truncation and defaults.
+        self.lmax, self.mmax, self._high_bandwidth = _resolve_sht_limits(nlat, nlon, lmax, mmax, grid)
+
         # TODO: include assertions regarding the dimensions
 
         # compute quadrature points and lmax based on the exactness of the quadrature
-        if self.grid == "legendre-gauss":
+        if self._high_bandwidth:
+            dense_nlat = 2 * nlat - 1
+            cost, weights = clenshaw_curtiss_weights(dense_nlat, -1, 1)
+            self._dense_nlat = dense_nlat
+        elif self.grid == "legendre-gauss":
             cost, weights = legendre_gauss_weights(nlat, -1, 1)
         elif self.grid == "lobatto":
             cost, weights = lobatto_weights(nlat, -1, 1)
@@ -135,9 +232,6 @@ class RealSHT(nn.Module):
 
         # apply cosine transform and flip them
         tq = torch.flip(torch.arccos(cost), dims=(0,))
-
-        # determine maximum degrees based on triangular truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid)
 
         # fold the 2*pi longitudinal scale factor of the forward-normalized FFT into the
         # quadrature weights. It is a constant prefactor of a linear transform, so folding it
@@ -150,6 +244,13 @@ class RealSHT(nn.Module):
 
         # remember quadrature weights
         self.register_buffer("weights", weights, persistent=False)
+
+        if self._high_bandwidth:
+            # An integer sign buffer preserves the input's complex precision and is unchanged
+            # by module dtype conversions, avoiding a conversion allocation in every forward.
+            signs = torch.ones(self.mmax, 1, dtype=torch.int8)
+            signs[1::2] = -1.0
+            self.register_buffer("_parity_signs", signs, persistent=False)
 
     def extra_repr(self):
         return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}"
@@ -179,10 +280,17 @@ class RealSHT(nn.Module):
 
         # transpose to put the contraction dim (nlat) on the fast axis
         x = x.transpose(-1, -2)
+
+        if self._high_bandwidth:
+            # Reconstruct the doubled pole-to-pole latitude grid before projection.
+            x = _periodic_latitude_extension(x, self._parity_signs)
+            x = _fourier_upsample_latitude(x, target_length=2 * x.shape[-1])
+            x = x[..., : self._dense_nlat]
+
         x_re = x.real.contiguous()
         x_im = x.imag.contiguous()
 
-        # Legendre-Gauss quadrature: contract over k=nlat (stride-1 in both operands)
+        # Legendre projection: contract over the latitude rings (stride-1 in both operands)
         w = self.weights.to(x_re.dtype)
         out_re = torch.einsum("...mk,mlk->...lm", x_re, w)
         out_im = torch.einsum("...mk,mlk->...lm", x_im, w)
@@ -297,6 +405,7 @@ class InverseRealSHT(nn.Module):
         t = torch.flip(torch.arccos(cost), dims=(0,))
 
         # determine maximum degrees based on triangular truncation
+        mmax = _adjust_equiangular_mmax(self.nlat, self.nlon, lmax, mmax, self.grid)
         self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid)
 
         # precompute associated Legendre polynomials
@@ -361,6 +470,12 @@ class RealVectorSHT(nn.Module):
     :math:`\hat{s}_l^m` and :math:`\hat{t}_l^m` using the derivatives of the
     associated Legendre polynomials.
 
+    On the pole-including equiangular grid, omitted limits retain the
+    conservative direct-quadrature default.  When an explicit ``lmax`` requests
+    a higher supported degree, the forward transform internally reconstructs a
+    denser meridional grid before applying the derivative-Legendre projection,
+    allowing recovery up to the grid's safe high-bandwidth limits.
+
     .. seealso::
         :doc:`/guide/spherical_harmonic_transforms`
             User guide with the full mathematical derivation of the vector SHT
@@ -400,9 +515,13 @@ class RealVectorSHT(nn.Module):
     .. note::
         This module uses **cuFFT** (via :func:`torch.fft.rfft`) to compute the
         longitudinal Fourier transform efficiently.  When running in **float16** or
-        **bfloat16** precision, cuFFT requires the transformed dimension (``nlon``)
-        to be a **power of two**.  If your grid does not satisfy this constraint and
-        the module is called inside a :class:`torch.autocast` context, guard it with
+        **bfloat16** precision, cuFFT requires transformed dimensions to satisfy
+        backend-specific size restrictions.  The direct path transforms ``nlon``;
+        an explicitly requested high-bandwidth equiangular transform additionally
+        transforms theta lengths ``2 * (nlat - 1)`` and ``4 * (nlat - 1)``.  The
+        The high-bandwidth path is validated for float32 and float64.  If a grid does
+        not satisfy these constraints and the module is called inside a
+        :class:`torch.autocast` context, guard it with
         ``torch.autocast(device_type="cuda", enabled=False)``::
 
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -425,8 +544,15 @@ class RealVectorSHT(nn.Module):
         self.norm = norm
         self.csphase = csphase
 
+        # Resolve once, preserving upstream triangular truncation and defaults.
+        self.lmax, self.mmax, self._high_bandwidth = _resolve_sht_limits(nlat, nlon, lmax, mmax, grid)
+
         # compute quadrature points
-        if self.grid == "legendre-gauss":
+        if self._high_bandwidth:
+            dense_nlat = 2 * nlat - 1
+            cost, weights = clenshaw_curtiss_weights(dense_nlat, -1, 1)
+            self._dense_nlat = dense_nlat
+        elif self.grid == "legendre-gauss":
             cost, weights = legendre_gauss_weights(nlat, -1, 1)
         elif self.grid == "lobatto":
             cost, weights = lobatto_weights(nlat, -1, 1)
@@ -438,9 +564,6 @@ class RealVectorSHT(nn.Module):
         # apply cosine transform and flip them
         tq = torch.flip(torch.arccos(cost), dims=(0,))
 
-        # determine maximum degrees based on triangular truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid)
-
         # precompute associated Legendre polynomials
         dpct = _precompute_dlegpoly(self.mmax, self.lmax, tq, norm=self.norm, csphase=self.csphase)
 
@@ -449,7 +572,9 @@ class RealVectorSHT(nn.Module):
         weights = 2.0 * torch.pi * weights
 
         # combine integration weights, normalization factor in to one:
-        l = torch.arange(0, self.lmax)
+        # The dense high-bandwidth projection is sensitive to the normalization
+        # factor's precision; keep that path in the same float64 precompute dtype.
+        l = torch.arange(0, self.lmax, dtype=torch.float64 if self._high_bandwidth else None)
         norm_factor = 1.0 / l / (l + 1)
         norm_factor[0] = 1.0
         weights = torch.einsum("dmlk,k,l->dmlk", dpct, weights, norm_factor).contiguous()
@@ -458,6 +583,13 @@ class RealVectorSHT(nn.Module):
 
         # remember quadrature weights
         self.register_buffer("weights", weights, persistent=False)
+
+        if self._high_bandwidth:
+            # Vector components acquire one additional sign under meridional
+            # continuation because both local tangent basis vectors reverse.
+            signs = torch.ones(self.mmax, 1, dtype=torch.int8)
+            signs[::2] = -1.0
+            self.register_buffer("_parity_signs", signs, persistent=False)
 
     def extra_repr(self):
         return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}"
@@ -490,6 +622,13 @@ class RealVectorSHT(nn.Module):
 
         # transpose to put the contraction dim (nlat) on the fast axis
         x = x.transpose(-1, -2)
+
+        if self._high_bandwidth:
+            # Reconstruct the doubled pole-to-pole latitude grid before projection.
+            x = _periodic_latitude_extension(x, self._parity_signs)
+            x = _fourier_upsample_latitude(x, target_length=2 * x.shape[-1])
+            x = x[..., : self._dense_nlat]
+
         x_re = x.real.contiguous()
         x_im = x.imag.contiguous()
 
@@ -611,6 +750,7 @@ class InverseRealVectorSHT(nn.Module):
         t = torch.flip(torch.arccos(cost), dims=(0,))
 
         # determine maximum degrees based on triangular truncation
+        mmax = _adjust_equiangular_mmax(self.nlat, self.nlon, lmax, mmax, self.grid)
         self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid)
 
         # precompute associated Legendre polynomials
