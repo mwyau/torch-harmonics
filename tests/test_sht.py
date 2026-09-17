@@ -40,7 +40,12 @@ from torch.autograd import gradcheck
 
 import torch_harmonics as th
 from torch_harmonics.quadrature import precompute_latitudes
-from torch_harmonics.sht import _fourier_upsample_latitude, _periodic_latitude_extension
+from torch_harmonics.sht import (
+    _fourier_shift_latitude,
+    _fourier_shift_latitude_adjoint,
+    _periodic_latitude_extension,
+    _periodic_latitude_extension_adjoint,
+)
 
 _devices = [(torch.device("cpu"),)]
 if torch.cuda.is_available():
@@ -133,23 +138,23 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
             self.assertEqual(list(inspect.signature(cls).parameters), expected)
             self.assertNotIn("analysis", repr(cls(9, 16, lmax=8, mmax=8)))
 
-    def test_default_equiangular_limits_and_low_bandwidth_path(self):
+    def test_default_equiangular_limits_and_direct_path(self):
         with self.assertWarnsRegex(UserWarning, "Default SHT truncation"):
             default = th.RealSHT(73, 144).to(self.device)
         self.assertEqual((default.lmax, default.mmax), (37, 37))
-        self.assertFalse(default._high_bandwidth)
+        self.assertEqual(default.weights.shape[-1], 73)
 
         with self.assertWarnsRegex(UserWarning, "Default SHT truncation"):
             inverse = th.InverseRealSHT(73, 144).to(self.device)
         self.assertEqual((inverse.lmax, inverse.mmax), (37, 37))
-        self.assertFalse(hasattr(inverse, "_high_bandwidth"))
+        self.assertEqual(inverse.pct.shape[-2], 73)
 
         low = th.RealSHT(73, 144, lmax=20, mmax=20).to(self.device)
         set_seed(333)
         signal = torch.randn(2, 73, 144, dtype=torch.float64, device=self.device)
         self.assertTrue(
             compare_tensors(
-                "default and explicit low-bandwidth scalar transforms",
+                "default and explicit direct scalar transforms",
                 default(signal)[..., :20, :20],
                 low(signal),
                 atol=1e-12,
@@ -157,21 +162,24 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
             )
         )
 
-    def test_equiangular_bandwidth_selection(self):
+    def test_equiangular_analysis_limits(self):
         direct = th.RealSHT(73, 144, lmax=37, mmax=37)
-        self.assertFalse(direct._high_bandwidth)
+        self.assertEqual(direct.weights.shape[-1], 73)
 
-        first_high = th.RealSHT(73, 144, lmax=38, mmax=38)
-        self.assertTrue(first_high._high_bandwidth)
+        first_resampled = th.RealSHT(73, 144, lmax=38, mmax=38)
+        self.assertEqual(first_resampled.weights.shape[-1], 73)
+        self.assertEqual(first_resampled._midpoint_weights.shape[-1], 72)
 
         mmax_only = th.RealSHT(73, 144, lmax=37, mmax=72)
         self.assertEqual((mmax_only.lmax, mmax_only.mmax), (37, 37))
-        self.assertFalse(mmax_only._high_bandwidth)
+        self.assertEqual(mmax_only.weights.shape[-1], 73)
 
         full = th.RealSHT(73, 144, lmax=72, mmax=72)
         self.assertEqual((full.lmax, full.mmax), (72, 72))
-        self.assertTrue(full._high_bandwidth)
-        self.assertEqual(full._dense_nlat, 145)
+        self.assertEqual(full.weights.shape[-1], 73)
+        self.assertEqual(full._quadrature_weights.shape[-1], 73)
+        self.assertEqual(full._midpoint_weights.shape[-1], 72)
+        self.assertEqual(full._latitude_shift_phase.shape, (2, 144))
 
         with self.assertRaisesRegex(ValueError, r"lmax <= 72.*mmax <= 72"):
             th.RealSHT(73, 144, lmax=73, mmax=73)
@@ -181,7 +189,7 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
         self.assertEqual((discarded.lmax, discarded.mmax), (72, 72))
 
         non_equiangular = th.RealSHT(17, 32, lmax=16, mmax=16, grid="legendre-gauss")
-        self.assertFalse(non_equiangular._high_bandwidth)
+        self.assertEqual(non_equiangular.weights.shape[-1], 17)
 
     def test_forward_inverse_limits_are_consistent_when_mmax_is_omitted(self):
         for nlat, nlon, expected in [(129, 144, (72, 72)), (129, 145, (73, 73))]:
@@ -190,10 +198,10 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
                 inverse = th.InverseRealSHT(nlat, nlon, lmax=100)
                 self.assertEqual((forward.lmax, forward.mmax), expected)
                 self.assertEqual((inverse.lmax, inverse.mmax), expected)
-                self.assertFalse(hasattr(inverse, "_high_bandwidth"))
+                self.assertEqual(inverse.pct.shape[-2], nlat)
 
     @parameterized.expand([[torch.float32], [torch.float64]])
-    def test_high_bandwidth_representative_modes(self, dtype):
+    def test_equiangular_representative_modes(self, dtype):
         nlat, nlon, lmax = 73, 144, 72
         modes = [(70, 0), (70, 1), (70, 2), (70, 69), (70, 70), (71, 0), (71, 1), (71, 70), (71, 71)]
         coeffs = torch.zeros(
@@ -213,7 +221,7 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
 
         atol = 5e-6 if dtype == torch.float32 else 1e-10
         rtol = 5e-5 if dtype == torch.float32 else 1e-10
-        self.assertTrue(compare_tensors("scalar high-bandwidth representative modes", recovered, coeffs, atol=atol, rtol=rtol))
+        self.assertTrue(compare_tensors("scalar equiangular representative modes", recovered, coeffs, atol=atol, rtol=rtol))
 
     @parameterized.expand(
         [
@@ -223,7 +231,7 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
             [torch.float64, 72],
         ]
     )
-    def test_high_bandwidth_random_triangular_spectra(self, dtype, limit):
+    def test_equiangular_random_triangular_spectra(self, dtype, limit):
         set_seed(333)
         coeffs = random_sht_coeffs(2, limit, limit, self.device, dtype=dtype)
         inverse = th.InverseRealSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=dtype)
@@ -233,7 +241,7 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
 
         atol = 5e-6 if dtype == torch.float32 else 1e-10
         rtol = 5e-5 if dtype == torch.float32 else 1e-10
-        self.assertTrue(compare_tensors("scalar high-bandwidth random triangular spectra", recovered, coeffs, atol=atol, rtol=rtol))
+        self.assertTrue(compare_tensors("scalar equiangular random triangular spectra", recovered, coeffs, atol=atol, rtol=rtol))
 
     @parameterized.expand(
         [
@@ -245,16 +253,16 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
             ["schmidt", False],
         ]
     )
-    def test_high_bandwidth_norm_and_phase_conventions(self, norm, csphase):
+    def test_equiangular_norm_and_phase_conventions(self, norm, csphase):
         lmax = mmax = 16
         coeffs = random_sht_coeffs(2, lmax, mmax, self.device, dtype=torch.float64)
         inverse = th.InverseRealSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
         forward = th.RealSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
         with torch.no_grad():
             recovered = forward(inverse(coeffs))
-        self.assertTrue(compare_tensors("scalar high-bandwidth norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
+        self.assertTrue(compare_tensors("scalar equiangular norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
 
-    def test_high_bandwidth_gradcheck(self):
+    def test_equiangular_gradcheck(self):
         transform = th.RealSHT(6, 12, lmax=5, mmax=5).to(self.device).double()
         signal = torch.randn(1, 6, 12, dtype=torch.float64, device=self.device, requires_grad=True)
 
@@ -773,8 +781,8 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
         self.assertTrue(compare_tensors("compiled backward", actual_grad, expected_grad, atol=1e-5, rtol=1e-5, verbose=verbose))
 
 
-class TestEquiangularSHTInterpolation(unittest.TestCase):
-    """Test the private periodic continuation and Fourier interpolation helpers."""
+class TestEquiangularSHTResampling(unittest.TestCase):
+    """Test the private periodic continuation, half-shift, and adjoint helpers."""
 
     @staticmethod
     def _periodic_signal(frequencies, amplitudes, length, real_dtype):
@@ -820,24 +828,60 @@ class TestEquiangularSHTInterpolation(unittest.TestCase):
                 torch.testing.assert_close(extended[..., :, m, nlat + k], sign * x[..., :, m, nlat - 2 - k])
 
     @parameterized.expand([[torch.float32], [torch.float64]])
-    def test_fourier_interpolation_known_modes_and_even_nyquist(self, real_dtype):
-        original_length, interpolated_length = 16, 32
+    def test_fourier_shift_known_modes_and_even_nyquist(self, real_dtype):
+        original_length = 16
         frequencies = [-5, -2, 3, 4]
         amplitudes = [0.3 + 0.2j, -0.4 + 0.1j, 0.15 - 0.35j, 0.2 + 0.05j]
         original = self._periodic_signal(frequencies, amplitudes, original_length, real_dtype)
-        interpolated = _fourier_upsample_latitude(original, interpolated_length)
-        expected = self._periodic_signal(frequencies, amplitudes, interpolated_length, real_dtype)
-        tolerance = 2e-5 if real_dtype == torch.float32 else 1e-12
-        torch.testing.assert_close(interpolated, expected, rtol=tolerance, atol=tolerance)
-        torch.testing.assert_close(interpolated[::2], original, rtol=tolerance, atol=tolerance)
-
         complex_dtype = torch.complex64 if real_dtype == torch.float32 else torch.complex128
+        fft_frequency = torch.fft.fftfreq(original_length, dtype=real_dtype)
+        phase = torch.polar(torch.ones_like(fft_frequency), torch.pi * fft_frequency).to(complex_dtype)
+
+        shifted = _fourier_shift_latitude(original, phase)
+        frequencies = torch.as_tensor(frequencies, dtype=real_dtype)
+        amplitudes = torch.as_tensor(amplitudes, dtype=complex_dtype)
+        shifted_theta = 2.0 * math.pi * (torch.arange(original_length, dtype=real_dtype) + 0.5) / original_length
+        expected = (amplitudes[:, None] * torch.exp(torch.complex(torch.zeros_like(shifted_theta), shifted_theta)[None, :] * frequencies[:, None])).sum(dim=0)
+        tolerance = 2e-5 if real_dtype == torch.float32 else 1e-12
+        torch.testing.assert_close(shifted, expected, rtol=tolerance, atol=tolerance)
+
         amplitude = torch.as_tensor(0.25 + 0.5j, dtype=complex_dtype)
         original_index = torch.arange(original_length, dtype=real_dtype)
         original = amplitude * (1.0 - 2.0 * original_index.remainder(2))
-        interpolated_index = torch.arange(interpolated_length, dtype=real_dtype)
-        expected = amplitude * torch.exp(torch.complex(torch.zeros_like(interpolated_index), -math.pi * interpolated_index / 2.0))
-        torch.testing.assert_close(_fourier_upsample_latitude(original, interpolated_length), expected, rtol=tolerance, atol=tolerance)
+        shifted_index = torch.arange(original_length, dtype=real_dtype)
+        expected = amplitude * torch.exp(torch.complex(torch.zeros_like(shifted_index), -math.pi * (shifted_index + 0.5)))
+        torch.testing.assert_close(_fourier_shift_latitude(original, phase), expected, rtol=tolerance, atol=tolerance)
+
+    @parameterized.expand([[torch.float32], [torch.float64]])
+    def test_midpoint_operator_adjoint_identity(self, real_dtype):
+        """The Fourier midpoint operator and its explicit adjoint agree under <u,v>."""
+
+        nlat, mmax = 11, 7
+        complex_dtype = torch.complex64 if real_dtype == torch.float32 else torch.complex128
+        frequency = torch.fft.fftfreq(2 * (nlat - 1), dtype=real_dtype)
+        phase = torch.polar(torch.ones_like(frequency), torch.pi * frequency).to(complex_dtype)
+
+        for vector, even_sign in ((False, 1), (True, -1)):
+            with self.subTest(vector=vector):
+                signs = torch.full((mmax, 1), even_sign, dtype=torch.int8)
+                signs[1::2] *= -1
+                if vector:
+                    x = torch.randn(2, 2, mmax, nlat, dtype=complex_dtype)
+                    y = torch.randn(2, 2, mmax, nlat - 1, dtype=complex_dtype)
+                else:
+                    x = torch.randn(2, 3, mmax, nlat, dtype=complex_dtype)
+                    y = torch.randn(2, 3, mmax, nlat - 1, dtype=complex_dtype)
+
+                midpoint = _fourier_shift_latitude(_periodic_latitude_extension(x, signs), phase)[..., : nlat - 1]
+                padded = torch.cat((y, torch.zeros_like(y)), dim=-1)
+                adjoint = _periodic_latitude_extension_adjoint(_fourier_shift_latitude_adjoint(padded, phase), signs)
+
+                torch.testing.assert_close(
+                    torch.vdot(midpoint.reshape(-1), y.reshape(-1)),
+                    torch.vdot(x.reshape(-1), adjoint.reshape(-1)),
+                    rtol=2e-5 if real_dtype == torch.float32 else 1e-12,
+                    atol=2e-5 if real_dtype == torch.float32 else 1e-12,
+                )
 
 
 @parameterized_class(("device"), _devices)
@@ -946,23 +990,23 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
     def setUp(self):
         disable_tf32()
 
-    def test_default_equiangular_limits_and_low_bandwidth_path(self):
+    def test_default_equiangular_limits_and_direct_path(self):
         with self.assertWarnsRegex(UserWarning, "Default SHT truncation"):
             default = th.RealVectorSHT(73, 144).to(self.device)
         self.assertEqual((default.lmax, default.mmax), (37, 37))
-        self.assertFalse(default._high_bandwidth)
+        self.assertEqual(default.weights.shape[-1], 73)
 
         with self.assertWarnsRegex(UserWarning, "Default SHT truncation"):
             inverse = th.InverseRealVectorSHT(73, 144).to(self.device)
         self.assertEqual((inverse.lmax, inverse.mmax), (37, 37))
-        self.assertFalse(hasattr(inverse, "_high_bandwidth"))
+        self.assertEqual(inverse.dpct.shape[-2], 73)
 
         low = th.RealVectorSHT(73, 144, lmax=20, mmax=20).to(self.device)
         set_seed(333)
         vector_field = torch.randn(2, 2, 73, 144, dtype=torch.float64, device=self.device)
         self.assertTrue(
             compare_tensors(
-                "default and explicit low-bandwidth vector transforms",
+                "default and explicit direct vector transforms",
                 default(vector_field)[..., :20, :20],
                 low(vector_field),
                 atol=1e-12,
@@ -970,21 +1014,24 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
             )
         )
 
-    def test_equiangular_bandwidth_selection(self):
+    def test_equiangular_analysis_limits(self):
         direct = th.RealVectorSHT(73, 144, lmax=37, mmax=37)
-        self.assertFalse(direct._high_bandwidth)
+        self.assertEqual(direct.weights.shape[-1], 73)
 
-        first_high = th.RealVectorSHT(73, 144, lmax=38, mmax=38)
-        self.assertTrue(first_high._high_bandwidth)
+        first_resampled = th.RealVectorSHT(73, 144, lmax=38, mmax=38)
+        self.assertEqual(first_resampled.weights.shape[-1], 73)
+        self.assertEqual(first_resampled._midpoint_weights.shape[-1], 72)
 
         mmax_only = th.RealVectorSHT(73, 144, lmax=37, mmax=72)
         self.assertEqual((mmax_only.lmax, mmax_only.mmax), (37, 37))
-        self.assertFalse(mmax_only._high_bandwidth)
+        self.assertEqual(mmax_only.weights.shape[-1], 73)
 
         full = th.RealVectorSHT(73, 144, lmax=72, mmax=72)
         self.assertEqual((full.lmax, full.mmax), (72, 72))
-        self.assertTrue(full._high_bandwidth)
-        self.assertEqual(full._dense_nlat, 145)
+        self.assertEqual(full.weights.shape[-1], 73)
+        self.assertEqual(full._quadrature_weights.shape[-1], 73)
+        self.assertEqual(full._midpoint_weights.shape[-1], 72)
+        self.assertEqual(full._latitude_shift_phase.shape, (2, 144))
 
         with self.assertRaisesRegex(ValueError, r"lmax <= 72.*mmax <= 72"):
             th.RealVectorSHT(73, 144, lmax=73, mmax=73)
@@ -994,7 +1041,7 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
         self.assertEqual((discarded.lmax, discarded.mmax), (72, 72))
 
         non_equiangular = th.RealVectorSHT(17, 32, lmax=16, mmax=16, grid="legendre-gauss")
-        self.assertFalse(non_equiangular._high_bandwidth)
+        self.assertEqual(non_equiangular.weights.shape[-1], 17)
 
     def test_forward_inverse_limits_are_consistent_when_mmax_is_omitted(self):
         for nlat, nlon, expected in [(129, 144, (72, 72)), (129, 145, (73, 73))]:
@@ -1003,10 +1050,10 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
                 inverse = th.InverseRealVectorSHT(nlat, nlon, lmax=100)
                 self.assertEqual((forward.lmax, forward.mmax), expected)
                 self.assertEqual((inverse.lmax, inverse.mmax), expected)
-                self.assertFalse(hasattr(inverse, "_high_bandwidth"))
+                self.assertEqual(inverse.dpct.shape[-2], nlat)
 
     @parameterized.expand([[torch.float32], [torch.float64]])
-    def test_high_bandwidth_spheroidal_and_toroidal_modes(self, dtype):
+    def test_equiangular_spheroidal_and_toroidal_modes(self, dtype):
         nlat, nlon, lmax = 73, 144, 72
         modes = [(70, 0), (70, 1), (70, 70), (71, 0), (71, 1), (71, 71)]
         inverse = th.InverseRealVectorSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(device=self.device, dtype=dtype)
@@ -1031,7 +1078,7 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
 
                 atol = 5e-6 if dtype == torch.float32 else 1e-10
                 rtol = 5e-5 if dtype == torch.float32 else 1e-10
-                self.assertTrue(compare_tensors("vector high-bandwidth representative modes", recovered, coeffs, atol=atol, rtol=rtol))
+                self.assertTrue(compare_tensors("vector equiangular representative modes", recovered, coeffs, atol=atol, rtol=rtol))
 
     @parameterized.expand(
         [
@@ -1041,7 +1088,7 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
             [torch.float64, 72],
         ]
     )
-    def test_high_bandwidth_random_triangular_spectra(self, dtype, limit):
+    def test_equiangular_random_triangular_spectra(self, dtype, limit):
         set_seed(333)
         coeffs = random_vector_sht_coeffs(2, limit, limit, self.device, zero_l0=True, dtype=dtype)
         inverse = th.InverseRealVectorSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=dtype)
@@ -1070,16 +1117,16 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
             ["schmidt", False],
         ]
     )
-    def test_high_bandwidth_norm_and_phase_conventions(self, norm, csphase):
+    def test_equiangular_norm_and_phase_conventions(self, norm, csphase):
         lmax = mmax = 16
         coeffs = random_vector_sht_coeffs(2, lmax, mmax, self.device, zero_l0=True, dtype=torch.float64)
         inverse = th.InverseRealVectorSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
         forward = th.RealVectorSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
         with torch.no_grad():
             recovered = forward(inverse(coeffs))
-        self.assertTrue(compare_tensors("vector high-bandwidth norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
+        self.assertTrue(compare_tensors("vector equiangular norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
 
-    def test_high_bandwidth_backward(self):
+    def test_equiangular_backward(self):
         transform = th.RealVectorSHT(8, 16, lmax=7, mmax=7).to(self.device).double()
         vector_field = torch.randn(2, 2, 8, 16, dtype=torch.float64, device=self.device, requires_grad=True)
         transform(vector_field).abs().square().mean().backward()
