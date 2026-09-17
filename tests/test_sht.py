@@ -133,9 +133,15 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
         disable_tf32()
 
     def test_public_signature_and_repr(self):
-        expected = ["nlat", "nlon", "lmax", "mmax", "grid", "norm", "csphase"]
-        for cls in (th.RealSHT, th.InverseRealSHT, th.RealVectorSHT, th.InverseRealVectorSHT):
-            self.assertEqual(list(inspect.signature(cls).parameters), expected)
+        forward_expected = ["nlat", "nlon", "lmax", "mmax", "grid", "norm", "csphase", "precompute_resampling"]
+        inverse_expected = ["nlat", "nlon", "lmax", "mmax", "grid", "norm", "csphase"]
+        for cls in (th.RealSHT, th.RealVectorSHT):
+            self.assertEqual(list(inspect.signature(cls).parameters), forward_expected)
+        for cls in (th.InverseRealSHT, th.InverseRealVectorSHT):
+            self.assertEqual(list(inspect.signature(cls).parameters), inverse_expected)
+        self.assertFalse(inspect.signature(th.RealSHT).parameters["precompute_resampling"].default)
+        self.assertFalse(inspect.signature(th.RealVectorSHT).parameters["precompute_resampling"].default)
+        for cls in (th.RealSHT, th.RealVectorSHT):
             self.assertNotIn("analysis", repr(cls(9, 16, lmax=8, mmax=8)))
 
     def test_default_equiangular_limits_and_direct_path(self):
@@ -150,6 +156,9 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
         self.assertEqual(inverse.pct.shape[-2], 73)
 
         low = th.RealSHT(73, 144, lmax=20, mmax=20).to(self.device)
+        low_precomputed = th.RealSHT(73, 144, lmax=20, mmax=20, precompute_resampling=True).to(self.device)
+        self.assertFalse(low_precomputed._resample_latitudes)
+        self.assertEqual(list(low_precomputed._buffers), ["weights"])
         set_seed(333)
         signal = torch.randn(2, 73, 144, dtype=torch.float64, device=self.device)
         self.assertTrue(
@@ -157,6 +166,15 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
                 "default and explicit direct scalar transforms",
                 default(signal)[..., :20, :20],
                 low(signal),
+                atol=1e-12,
+                rtol=1e-12,
+            )
+        )
+        self.assertTrue(
+            compare_tensors(
+                "direct scalar precompute flag is harmless",
+                low(signal),
+                low_precomputed(signal),
                 atol=1e-12,
                 rtol=1e-12,
             )
@@ -214,14 +232,21 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
         for index, (degree, order) in enumerate(modes):
             coeffs[index, degree, order] = 1.0 if order == 0 else 0.375 + 0.625j
 
-        inverse = th.InverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(device=self.device, dtype=dtype)
-        forward = th.RealSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(device=self.device, dtype=dtype)
-        with torch.no_grad():
-            recovered = forward(inverse(coeffs))
-
         atol = 5e-6 if dtype == torch.float32 else 1e-10
         rtol = 5e-5 if dtype == torch.float32 else 1e-10
-        self.assertTrue(compare_tensors("scalar equiangular representative modes", recovered, coeffs, atol=atol, rtol=rtol))
+        inverse = th.InverseRealSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(device=self.device, dtype=dtype)
+        for precompute_resampling in (False, True):
+            with self.subTest(precompute_resampling=precompute_resampling):
+                forward = th.RealSHT(
+                    nlat,
+                    nlon,
+                    lmax=lmax,
+                    mmax=lmax,
+                    precompute_resampling=precompute_resampling,
+                ).to(device=self.device, dtype=dtype)
+                with torch.no_grad():
+                    recovered = forward(inverse(coeffs))
+                self.assertTrue(compare_tensors("scalar equiangular representative modes", recovered, coeffs, atol=atol, rtol=rtol))
 
     @parameterized.expand(
         [
@@ -234,14 +259,21 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
     def test_equiangular_random_triangular_spectra(self, dtype, limit):
         set_seed(333)
         coeffs = random_sht_coeffs(2, limit, limit, self.device, dtype=dtype)
-        inverse = th.InverseRealSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=dtype)
-        forward = th.RealSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=dtype)
-        with torch.no_grad():
-            recovered = forward(inverse(coeffs))
-
         atol = 5e-6 if dtype == torch.float32 else 1e-10
         rtol = 5e-5 if dtype == torch.float32 else 1e-10
-        self.assertTrue(compare_tensors("scalar equiangular random triangular spectra", recovered, coeffs, atol=atol, rtol=rtol))
+        inverse = th.InverseRealSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=dtype)
+        for precompute_resampling in (False, True):
+            with self.subTest(precompute_resampling=precompute_resampling):
+                forward = th.RealSHT(
+                    73,
+                    144,
+                    lmax=limit,
+                    mmax=limit,
+                    precompute_resampling=precompute_resampling,
+                ).to(device=self.device, dtype=dtype)
+                with torch.no_grad():
+                    recovered = forward(inverse(coeffs))
+                self.assertTrue(compare_tensors("scalar equiangular random triangular spectra", recovered, coeffs, atol=atol, rtol=rtol))
 
     @parameterized.expand(
         [
@@ -257,20 +289,32 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
         lmax = mmax = 16
         coeffs = random_sht_coeffs(2, lmax, mmax, self.device, dtype=torch.float64)
         inverse = th.InverseRealSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
-        forward = th.RealSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
-        with torch.no_grad():
-            recovered = forward(inverse(coeffs))
-        self.assertTrue(compare_tensors("scalar equiangular norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
+        for precompute_resampling in (False, True):
+            with self.subTest(precompute_resampling=precompute_resampling):
+                forward = th.RealSHT(
+                    17,
+                    32,
+                    lmax=lmax,
+                    mmax=mmax,
+                    norm=norm,
+                    csphase=csphase,
+                    precompute_resampling=precompute_resampling,
+                ).to(self.device)
+                with torch.no_grad():
+                    recovered = forward(inverse(coeffs))
+                self.assertTrue(compare_tensors("scalar equiangular norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
 
     def test_equiangular_gradcheck(self):
-        transform = th.RealSHT(6, 12, lmax=5, mmax=5).to(self.device).double()
-        signal = torch.randn(1, 6, 12, dtype=torch.float64, device=self.device, requires_grad=True)
+        for precompute_resampling in (False, True):
+            with self.subTest(precompute_resampling=precompute_resampling):
+                transform = th.RealSHT(6, 12, lmax=5, mmax=5, precompute_resampling=precompute_resampling).to(self.device).double()
+                signal = torch.randn(1, 6, 12, dtype=torch.float64, device=self.device, requires_grad=True)
 
-        def loss(x):
-            coeffs = transform(x)
-            return (coeffs.real.square() + coeffs.imag.square()).sum()
+                def loss(x):
+                    coeffs = transform(x)
+                    return (coeffs.real.square() + coeffs.imag.square()).sum()
 
-        self.assertTrue(gradcheck(loss, (signal,), eps=1e-6, atol=1e-8, rtol=1e-6))
+                self.assertTrue(gradcheck(loss, (signal,), eps=1e-6, atol=1e-8, rtol=1e-6))
 
     @parameterized.expand(
         [
@@ -885,6 +929,161 @@ class TestEquiangularSHTResampling(unittest.TestCase):
 
 
 @parameterized_class(("device"), _devices)
+class TestPrecomputedResampling(unittest.TestCase):
+    """Test the optional precomputed latitude projection representation."""
+
+    def setUp(self):
+        disable_tf32()
+
+    @staticmethod
+    def _cases():
+        return (
+            (th.RealSHT, (2, 9, 16), (8, 8, 9), (8, 8, 9, 2)),
+            (th.RealVectorSHT, (2, 2, 9, 16), (2, 8, 8, 9), (2, 8, 8, 9, 2)),
+        )
+
+    def test_storage_and_shapes(self):
+        runtime_names = {"weights", "_quadrature_weights", "_midpoint_weights", "_latitude_shift_phase", "_parity_signs"}
+        for cls, _, runtime_shape, effective_shape in self._cases():
+            with self.subTest(transform=cls.__name__):
+                runtime = cls(9, 16, lmax=8, mmax=8).to(self.device)
+                precomputed = cls(9, 16, lmax=8, mmax=8, precompute_resampling=True).to(self.device)
+
+                self.assertEqual(set(runtime._buffers), runtime_names)
+                self.assertEqual(list(precomputed._buffers), ["weights"])
+                for name in runtime_names - {"weights"}:
+                    self.assertNotIn(name, precomputed._buffers)
+
+                self.assertEqual(tuple(runtime.weights.shape), runtime_shape)
+                self.assertEqual(tuple(precomputed.weights.shape), effective_shape)
+                effective = torch.view_as_complex(precomputed.weights)
+                self.assertEqual(tuple(effective.shape), runtime_shape)
+                self.assertEqual(effective.data_ptr(), precomputed.weights.data_ptr())
+                self.assertTrue(precomputed.weights.is_contiguous())
+                self.assertGreater(effective.imag.abs().max().item(), 0.0)
+
+                runtime_bytes = runtime.weights.numel() * runtime.weights.element_size()
+                effective_bytes = precomputed.weights.numel() * precomputed.weights.element_size()
+                self.assertEqual(effective_bytes, 2 * runtime_bytes)
+
+    def test_runtime_and_precomputed_equivalence(self):
+        for dtype, tolerance in ((torch.float32, 2e-5), (torch.float64, 2e-12)):
+            for cls, _, _, _ in self._cases():
+                with self.subTest(transform=cls.__name__, dtype=dtype):
+                    runtime = cls(73, 144, lmax=72, mmax=72).to(device=self.device, dtype=dtype)
+                    precomputed = cls(73, 144, lmax=72, mmax=72, precompute_resampling=True).to(device=self.device, dtype=dtype)
+                    set_seed(8128)
+                    if cls is th.RealSHT:
+                        shape = (2, 73, 144)
+                    else:
+                        shape = (2, 2, 73, 144)
+                    x = torch.randn(*shape, device=self.device, dtype=dtype)
+                    runtime_output = runtime(x)
+                    precomputed_output = precomputed(x)
+                    difference = (runtime_output - precomputed_output).abs()
+                    self.assertLessEqual(difference.max().item(), tolerance)
+                    self.assertLessEqual(difference.norm().item() / runtime_output.norm().item(), tolerance)
+
+    def test_non_equiangular_path_ignores_flag(self):
+        for cls, _, _, _ in self._cases():
+            with self.subTest(transform=cls.__name__):
+                runtime = cls(17, 32, lmax=16, mmax=16, grid="legendre-gauss")
+                precomputed = cls(17, 32, lmax=16, mmax=16, grid="legendre-gauss", precompute_resampling=True)
+                self.assertFalse(precomputed._resample_latitudes)
+                self.assertEqual(list(precomputed._buffers), ["weights"])
+                self.assertTrue(torch.equal(runtime.weights, precomputed.weights))
+
+    def test_dtype_and_device_lifecycle(self):
+        for cls, _, _, _ in self._cases():
+            with self.subTest(transform=cls.__name__):
+                transitions = [
+                    ("float", lambda m: m.float()),
+                    ("double", lambda m: m.double()),
+                    ("to_float", lambda m: m.to(dtype=torch.float32)),
+                    ("to_double", lambda m: m.to(dtype=torch.float64)),
+                ]
+                if torch.cuda.is_available():
+                    transitions.extend(
+                        [
+                            ("cuda", lambda m: m.cuda()),
+                            ("cpu", lambda m: m.cpu()),
+                            ("float_cuda", lambda m: m.float().cuda()),
+                            ("cpu_double", lambda m: m.cpu().double()),
+                        ]
+                    )
+
+                for name, transition in transitions:
+                    with self.subTest(transition=name):
+                        module = cls(9, 16, lmax=8, mmax=8, precompute_resampling=True)
+                        module = transition(module)
+                        real_dtype = module.weights.dtype
+                        expected_complex_dtype = torch.complex64 if real_dtype == torch.float32 else torch.complex128
+                        device = module.weights.device
+                        if cls is th.RealSHT:
+                            shape = (2, 9, 16)
+                        else:
+                            shape = (2, 2, 9, 16)
+                        x = torch.randn(*shape, device=device, dtype=real_dtype)
+                        expected = cls(9, 16, lmax=8, mmax=8).to(device=device, dtype=real_dtype)(x)
+                        actual = module(x)
+                        self.assertTrue(
+                            compare_tensors(
+                                "lifecycle output", actual, expected, atol=2e-5 if real_dtype == torch.float32 else 2e-12, rtol=2e-5 if real_dtype == torch.float32 else 2e-12
+                            )
+                        )
+
+                        complex_weights = torch.view_as_complex(module.weights)
+                        self.assertEqual(complex_weights.dtype, expected_complex_dtype)
+                        self.assertEqual(complex_weights.data_ptr(), module.weights.data_ptr())
+                        self.assertGreater(complex_weights.imag.abs().max().item(), 0.0)
+
+    def test_input_gradients_and_gradcheck(self):
+        for cls, _, _, _ in self._cases():
+            with self.subTest(transform=cls.__name__):
+                runtime = cls(6, 12, lmax=5, mmax=5).to(device=self.device, dtype=torch.float64)
+                precomputed = cls(6, 12, lmax=5, mmax=5, precompute_resampling=True).to(device=self.device, dtype=torch.float64)
+                shape = (1, 6, 12) if cls is th.RealSHT else (1, 2, 6, 12)
+                set_seed(9012)
+                base = torch.randn(*shape, device=self.device, dtype=torch.float64)
+                runtime_input = base.clone().requires_grad_()
+                precomputed_input = base.clone().requires_grad_()
+
+                def energy(module, value):
+                    output = module(value)
+                    return output.real.square().mean() + output.imag.square().mean()
+
+                (runtime_gradient,) = torch.autograd.grad(energy(runtime, runtime_input), runtime_input)
+                (precomputed_gradient,) = torch.autograd.grad(energy(precomputed, precomputed_input), precomputed_input)
+                torch.testing.assert_close(precomputed_gradient, runtime_gradient, rtol=2e-10, atol=2e-10)
+
+                def loss(value):
+                    return energy(precomputed, value)
+
+                check_input = base[:1].clone().requires_grad_()
+                self.assertTrue(gradcheck(loss, (check_input,), eps=1e-6, atol=1e-8, rtol=1e-6))
+
+    def test_compile_forward_and_backward(self):
+        for cls, _, _, _ in self._cases():
+            with self.subTest(transform=cls.__name__):
+                module = cls(9, 16, lmax=8, mmax=8, precompute_resampling=True).to(device=self.device, dtype=torch.float32)
+                shape = (2, 9, 16) if cls is th.RealSHT else (2, 2, 9, 16)
+                set_seed(4567)
+                x = torch.randn(*shape, device=self.device, dtype=torch.float32, requires_grad=True)
+
+                eager_output = module(x)
+                eager_loss = eager_output.real.square().mean() + eager_output.imag.square().mean()
+                (eager_gradient,) = torch.autograd.grad(eager_loss, x)
+
+                compiled = torch.compile(module, fullgraph=True, dynamic=False)
+                compiled_output = compiled(x)
+                compiled_loss = compiled_output.real.square().mean() + compiled_output.imag.square().mean()
+                (compiled_gradient,) = torch.autograd.grad(compiled_loss, x)
+
+                torch.testing.assert_close(compiled_output, eager_output, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(compiled_gradient, eager_gradient, rtol=1e-5, atol=1e-5)
+
+
+@parameterized_class(("device"), _devices)
 class TestSphericalHarmonicsFunctions(unittest.TestCase):
     """Test fundamental properties of the real spherical harmonic basis functions.
 
@@ -1002,6 +1201,9 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
         self.assertEqual(inverse.dpct.shape[-2], 73)
 
         low = th.RealVectorSHT(73, 144, lmax=20, mmax=20).to(self.device)
+        low_precomputed = th.RealVectorSHT(73, 144, lmax=20, mmax=20, precompute_resampling=True).to(self.device)
+        self.assertFalse(low_precomputed._resample_latitudes)
+        self.assertEqual(list(low_precomputed._buffers), ["weights"])
         set_seed(333)
         vector_field = torch.randn(2, 2, 73, 144, dtype=torch.float64, device=self.device)
         self.assertTrue(
@@ -1009,6 +1211,15 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
                 "default and explicit direct vector transforms",
                 default(vector_field)[..., :20, :20],
                 low(vector_field),
+                atol=1e-12,
+                rtol=1e-12,
+            )
+        )
+        self.assertTrue(
+            compare_tensors(
+                "direct vector precompute flag is harmless",
+                low(vector_field),
+                low_precomputed(vector_field),
                 atol=1e-12,
                 rtol=1e-12,
             )
@@ -1057,28 +1268,34 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
         nlat, nlon, lmax = 73, 144, 72
         modes = [(70, 0), (70, 1), (70, 70), (71, 0), (71, 1), (71, 71)]
         inverse = th.InverseRealVectorSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(device=self.device, dtype=dtype)
-        forward = th.RealVectorSHT(nlat, nlon, lmax=lmax, mmax=lmax).to(device=self.device, dtype=dtype)
+        atol = 5e-6 if dtype == torch.float32 else 1e-10
+        rtol = 5e-5 if dtype == torch.float32 else 1e-10
+        for precompute_resampling in (False, True):
+            forward = th.RealVectorSHT(
+                nlat,
+                nlon,
+                lmax=lmax,
+                mmax=lmax,
+                precompute_resampling=precompute_resampling,
+            ).to(device=self.device, dtype=dtype)
+            for channel in range(2):
+                with self.subTest(channel=channel, precompute_resampling=precompute_resampling):
+                    coeffs = torch.zeros(
+                        len(modes),
+                        2,
+                        lmax,
+                        lmax,
+                        dtype=torch.complex64 if dtype == torch.float32 else torch.complex128,
+                        device=self.device,
+                    )
+                    for index, (degree, order) in enumerate(modes):
+                        value = 1.0 if order == 0 else 0.375 + 0.625j
+                        coeffs[index, channel, degree, order] = value
 
-        for channel in range(2):
-            with self.subTest(channel=channel):
-                coeffs = torch.zeros(
-                    len(modes),
-                    2,
-                    lmax,
-                    lmax,
-                    dtype=torch.complex64 if dtype == torch.float32 else torch.complex128,
-                    device=self.device,
-                )
-                for index, (degree, order) in enumerate(modes):
-                    value = 1.0 if order == 0 else 0.375 + 0.625j
-                    coeffs[index, channel, degree, order] = value
+                    with torch.no_grad():
+                        recovered = forward(inverse(coeffs))
 
-                with torch.no_grad():
-                    recovered = forward(inverse(coeffs))
-
-                atol = 5e-6 if dtype == torch.float32 else 1e-10
-                rtol = 5e-5 if dtype == torch.float32 else 1e-10
-                self.assertTrue(compare_tensors("vector equiangular representative modes", recovered, coeffs, atol=atol, rtol=rtol))
+                    self.assertTrue(compare_tensors("vector equiangular representative modes", recovered, coeffs, atol=atol, rtol=rtol))
 
     @parameterized.expand(
         [
@@ -1092,20 +1309,27 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
         set_seed(333)
         coeffs = random_vector_sht_coeffs(2, limit, limit, self.device, zero_l0=True, dtype=dtype)
         inverse = th.InverseRealVectorSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=dtype)
-        forward = th.RealVectorSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=dtype)
-        with torch.no_grad():
-            recovered = forward(inverse(coeffs))
-
         if dtype == torch.float32:
             # dP/dtheta and P/sin(theta) contractions accumulate a few more
             # float32 ulps than the scalar projection at the highest degrees.
             atol, rtol = 2.5e-5, 1e-6
         else:
             atol, rtol = 1e-10, 1e-10
-        difference = (recovered - coeffs).abs()
-        relative_error = difference.norm() / coeffs.abs().norm()
-        self.assertLessEqual(relative_error.item(), rtol)
-        self.assertLessEqual(difference.max().item(), atol)
+        for precompute_resampling in (False, True):
+            with self.subTest(precompute_resampling=precompute_resampling):
+                forward = th.RealVectorSHT(
+                    73,
+                    144,
+                    lmax=limit,
+                    mmax=limit,
+                    precompute_resampling=precompute_resampling,
+                ).to(device=self.device, dtype=dtype)
+                with torch.no_grad():
+                    recovered = forward(inverse(coeffs))
+                difference = (recovered - coeffs).abs()
+                relative_error = difference.norm() / coeffs.abs().norm()
+                self.assertLessEqual(relative_error.item(), rtol)
+                self.assertLessEqual(difference.max().item(), atol)
 
     @parameterized.expand(
         [
@@ -1121,17 +1345,29 @@ class TestVectorSphericalHarmonicTransform(unittest.TestCase):
         lmax = mmax = 16
         coeffs = random_vector_sht_coeffs(2, lmax, mmax, self.device, zero_l0=True, dtype=torch.float64)
         inverse = th.InverseRealVectorSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
-        forward = th.RealVectorSHT(17, 32, lmax=lmax, mmax=mmax, norm=norm, csphase=csphase).to(self.device)
-        with torch.no_grad():
-            recovered = forward(inverse(coeffs))
-        self.assertTrue(compare_tensors("vector equiangular norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
+        for precompute_resampling in (False, True):
+            with self.subTest(precompute_resampling=precompute_resampling):
+                forward = th.RealVectorSHT(
+                    17,
+                    32,
+                    lmax=lmax,
+                    mmax=mmax,
+                    norm=norm,
+                    csphase=csphase,
+                    precompute_resampling=precompute_resampling,
+                ).to(self.device)
+                with torch.no_grad():
+                    recovered = forward(inverse(coeffs))
+                self.assertTrue(compare_tensors("vector equiangular norm and csphase", recovered, coeffs, atol=1e-10, rtol=1e-10))
 
     def test_equiangular_backward(self):
-        transform = th.RealVectorSHT(8, 16, lmax=7, mmax=7).to(self.device).double()
-        vector_field = torch.randn(2, 2, 8, 16, dtype=torch.float64, device=self.device, requires_grad=True)
-        transform(vector_field).abs().square().mean().backward()
-        self.assertIsNotNone(vector_field.grad)
-        self.assertTrue(torch.isfinite(vector_field.grad).all())
+        for precompute_resampling in (False, True):
+            with self.subTest(precompute_resampling=precompute_resampling):
+                transform = th.RealVectorSHT(8, 16, lmax=7, mmax=7, precompute_resampling=precompute_resampling).to(self.device).double()
+                vector_field = torch.randn(2, 2, 8, 16, dtype=torch.float64, device=self.device, requires_grad=True)
+                transform(vector_field).abs().square().mean().backward()
+                self.assertIsNotNone(vector_field.grad)
+                self.assertTrue(torch.isfinite(vector_field.grad).all())
 
     @parameterized.expand(
         [

@@ -119,6 +119,38 @@ def _fold_resampled_latitude(
     return quadrature_weights * x + folded
 
 
+def _precompute_resampled_projection(
+    weights: torch.Tensor,
+    signs: torch.Tensor,
+    quadrature_weights: torch.Tensor,
+    midpoint_weights: torch.Tensor,
+    phase: torch.Tensor,
+    row_chunk: int = 4,
+) -> torch.Tensor:
+    """Fold projection rows into an effective original-ring projection."""
+
+    if row_chunk < 1:
+        raise ValueError("row_chunk must be positive")
+
+    rows = weights.transpose(-3, -2)
+    effective_rows = torch.empty(rows.shape, dtype=phase.dtype, device=rows.device)
+
+    for start in range(0, rows.shape[-3], row_chunk):
+        size = min(row_chunk, rows.shape[-3] - start)
+        rows_chunk = rows.narrow(-3, start, size)
+        folded = _fold_resampled_latitude(
+            rows_chunk,
+            signs,
+            quadrature_weights,
+            midpoint_weights,
+            phase,
+        )
+        # U is Hermitian, so P U = conj(U @ P.T).T.
+        effective_rows.narrow(-3, start, size).copy_(folded.conj())
+
+    return effective_rows.transpose(-3, -2).contiguous()
+
+
 def _resolve_sht_limits(nlat, nlon, lmax, mmax, grid):
     """Resolve upstream triangular limits and validate resampled analysis."""
 
@@ -192,6 +224,12 @@ class RealSHT(nn.Module):
     csphase : bool
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
+    precompute_resampling : bool
+        For resampled equiangular analysis, precompute the latitude-resampling
+        operator into the projection weights. This increases persistent projection
+        storage and construction cost but reduces per-forward work and temporary
+        memory. Has no effect when latitude resampling is not required. By default
+        ``False``.
 
     Examples
     --------
@@ -226,7 +264,17 @@ class RealSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True):
+    def __init__(
+        self,
+        nlat,
+        nlon,
+        lmax=None,
+        mmax=None,
+        grid="equiangular",
+        norm="ortho",
+        csphase=True,
+        precompute_resampling=False,
+    ):
 
         super().__init__()
 
@@ -235,6 +283,7 @@ class RealSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
+        self.precompute_resampling = precompute_resampling
 
         # Resolve once, preserving upstream triangular truncation and defaults.
         self.lmax, self.mmax = _resolve_sht_limits(nlat, nlon, lmax, mmax, grid)
@@ -264,22 +313,34 @@ class RealSHT(nn.Module):
         weights = 2.0 * torch.pi * weights
 
         if resample_latitudes:
-            # The Appendix-A folded-ring optimization replaces the dense final
-            # projection by an original-ring projection. The even/odd dense CC
-            # weights are kept separate because the odd contribution is applied
-            # between A and its adjoint at runtime.
-            pct = _precompute_legpoly(self.mmax, self.lmax, tq[::2], norm=self.norm, csphase=self.csphase)
-            self.register_buffer("weights", pct.contiguous(), persistent=False)
-            self.register_buffer("_quadrature_weights", weights[::2].contiguous(), persistent=False)
-            self.register_buffer("_midpoint_weights", weights[1::2].contiguous(), persistent=False)
+            projection_weights = _precompute_legpoly(self.mmax, self.lmax, tq[::2], norm=self.norm, csphase=self.csphase)
+            quadrature_weights = weights[::2].contiguous()
+            midpoint_weights = weights[1::2].contiguous()
 
             periodic_length = 2 * (nlat - 1)
             frequencies = torch.fft.fftfreq(periodic_length, dtype=torch.float64)
             phase = torch.polar(torch.ones_like(frequencies), torch.pi * frequencies)
-            # Keep the phase as two real channels so module.to(dtype=...) does
-            # not discard the imaginary part of a complex buffer.
-            phase = torch.stack((phase.real, phase.imag), dim=0)
-            self.register_buffer("_latitude_shift_phase", phase.contiguous(), persistent=False)
+            signs = torch.ones(self.mmax, 1, dtype=torch.int8)
+            signs[1::2] = -1
+
+            if self.precompute_resampling:
+                effective_weights = _precompute_resampled_projection(
+                    projection_weights,
+                    signs,
+                    quadrature_weights,
+                    midpoint_weights,
+                    phase,
+                )
+                self.register_buffer("weights", torch.view_as_real(effective_weights).contiguous(), persistent=False)
+            else:
+                self.register_buffer("weights", projection_weights.contiguous(), persistent=False)
+                self.register_buffer("_quadrature_weights", quadrature_weights, persistent=False)
+                self.register_buffer("_midpoint_weights", midpoint_weights, persistent=False)
+                # Keep the phase as two real channels so module.to(dtype=...) does
+                # not discard the imaginary part of a complex buffer.
+                phase = torch.stack((phase.real, phase.imag), dim=0)
+                self.register_buffer("_latitude_shift_phase", phase.contiguous(), persistent=False)
+                self.register_buffer("_parity_signs", signs, persistent=False)
         else:
             # combine quadrature weights with the legendre weights
             pct = _precompute_legpoly(self.mmax, self.lmax, tq, norm=self.norm, csphase=self.csphase)
@@ -287,13 +348,6 @@ class RealSHT(nn.Module):
 
             # remember quadrature weights
             self.register_buffer("weights", weights, persistent=False)
-
-        if self._resample_latitudes:
-            # An integer sign buffer preserves the input's complex precision and is unchanged
-            # by module dtype conversions, avoiding a conversion allocation in every forward.
-            signs = torch.ones(self.mmax, 1, dtype=torch.int8)
-            signs[1::2] = -1.0
-            self.register_buffer("_parity_signs", signs, persistent=False)
 
     def extra_repr(self):
         return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}"
@@ -323,6 +377,10 @@ class RealSHT(nn.Module):
 
         # transpose to put the contraction dim (nlat) on the fast axis
         x = x.transpose(-1, -2)
+
+        if self._resample_latitudes and self.precompute_resampling:
+            weights = torch.view_as_complex(self.weights)
+            return torch.einsum("...mk,mlk->...lm", x, weights)
 
         if self._resample_latitudes:
             phase = self._latitude_shift_phase.to(x.real.dtype)
@@ -547,6 +605,12 @@ class RealVectorSHT(nn.Module):
     csphase : bool
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
+    precompute_resampling : bool
+        For resampled equiangular analysis, precompute the latitude-resampling
+        operator into the projection weights. This increases persistent projection
+        storage and construction cost but reduces per-forward work and temporary
+        memory. Has no effect when latitude resampling is not required. By default
+        ``False``.
 
     Examples
     --------
@@ -581,7 +645,17 @@ class RealVectorSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True):
+    def __init__(
+        self,
+        nlat,
+        nlon,
+        lmax=None,
+        mmax=None,
+        grid="equiangular",
+        norm="ortho",
+        csphase=True,
+        precompute_resampling=False,
+    ):
 
         super().__init__()
 
@@ -590,6 +664,7 @@ class RealVectorSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
+        self.precompute_resampling = precompute_resampling
 
         # Resolve once, preserving upstream triangular truncation and defaults.
         self.lmax, self.mmax = _resolve_sht_limits(nlat, nlon, lmax, mmax, grid)
@@ -628,23 +703,36 @@ class RealVectorSHT(nn.Module):
         norm_factor = 1.0 / l / (l + 1)
         norm_factor[0] = 1.0
         if resample_latitudes:
-            # Keep 2*pi and the split dense quadrature weights outside the
-            # Legendre tensor; the midpoint factor is folded at runtime as
-            # A* Q_o A x.
             projection_weights = torch.einsum("dmlk,l->dmlk", dpct, norm_factor).contiguous()
             # since the second component is imaginary, we need to take complex conjugation into account
             projection_weights[1] = -1 * projection_weights[1]
-            self.register_buffer("weights", projection_weights, persistent=False)
-            self.register_buffer("_quadrature_weights", weights[::2].contiguous(), persistent=False)
-            self.register_buffer("_midpoint_weights", weights[1::2].contiguous(), persistent=False)
+            quadrature_weights = weights[::2].contiguous()
+            midpoint_weights = weights[1::2].contiguous()
 
             periodic_length = 2 * (nlat - 1)
             frequencies = torch.fft.fftfreq(periodic_length, dtype=torch.float64)
             phase = torch.polar(torch.ones_like(frequencies), torch.pi * frequencies)
-            # Keep the phase as two real channels so module.to(dtype=...) does
-            # not discard the imaginary part of a complex buffer.
-            phase = torch.stack((phase.real, phase.imag), dim=0)
-            self.register_buffer("_latitude_shift_phase", phase.contiguous(), persistent=False)
+            signs = torch.ones(self.mmax, 1, dtype=torch.int8)
+            signs[::2] = -1
+
+            if self.precompute_resampling:
+                effective_weights = _precompute_resampled_projection(
+                    projection_weights,
+                    signs,
+                    quadrature_weights,
+                    midpoint_weights,
+                    phase,
+                )
+                self.register_buffer("weights", torch.view_as_real(effective_weights).contiguous(), persistent=False)
+            else:
+                self.register_buffer("weights", projection_weights, persistent=False)
+                self.register_buffer("_quadrature_weights", quadrature_weights, persistent=False)
+                self.register_buffer("_midpoint_weights", midpoint_weights, persistent=False)
+                # Keep the phase as two real channels so module.to(dtype=...) does
+                # not discard the imaginary part of a complex buffer.
+                phase = torch.stack((phase.real, phase.imag), dim=0)
+                self.register_buffer("_latitude_shift_phase", phase.contiguous(), persistent=False)
+                self.register_buffer("_parity_signs", signs, persistent=False)
         else:
             weights = torch.einsum("dmlk,k,l->dmlk", dpct, weights, norm_factor).contiguous()
             # since the second component is imaginary, we need to take complex conjugation into account
@@ -652,13 +740,6 @@ class RealVectorSHT(nn.Module):
 
             # remember quadrature weights
             self.register_buffer("weights", weights, persistent=False)
-
-        if self._resample_latitudes:
-            # Vector components acquire one additional sign under meridional
-            # continuation because both local tangent basis vectors reverse.
-            signs = torch.ones(self.mmax, 1, dtype=torch.int8)
-            signs[::2] = -1.0
-            self.register_buffer("_parity_signs", signs, persistent=False)
 
     def extra_repr(self):
         return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}"
@@ -691,6 +772,17 @@ class RealVectorSHT(nn.Module):
 
         # transpose to put the contraction dim (nlat) on the fast axis
         x = x.transpose(-1, -2)
+
+        if self._resample_latitudes and self.precompute_resampling:
+            weights = torch.view_as_complex(self.weights)
+            w0 = weights[0]
+            w1 = weights[1]
+
+            theta = x[..., 0, :, :]
+            longitude = x[..., 1, :, :]
+            spheroidal = torch.einsum("...mk,mlk->...lm", theta, w0) + 1j * torch.einsum("...mk,mlk->...lm", longitude, w1)
+            toroidal = 1j * torch.einsum("...mk,mlk->...lm", theta, w1) - torch.einsum("...mk,mlk->...lm", longitude, w0)
+            return torch.stack((spheroidal, toroidal), dim=-3)
 
         if self._resample_latitudes:
             phase = self._latitude_shift_phase.to(x.real.dtype)
