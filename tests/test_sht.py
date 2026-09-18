@@ -39,6 +39,12 @@ from torch.autograd import gradcheck
 
 import torch_harmonics as th
 from torch_harmonics.quadrature import precompute_latitudes
+from torch_harmonics.sht import (
+    _fourier_shift_latitude,
+    _fourier_shift_latitude_adjoint,
+    _periodic_latitude_extension,
+    _periodic_latitude_extension_adjoint,
+)
 
 _devices = [(torch.device("cpu"),)]
 if torch.cuda.is_available():
@@ -775,6 +781,205 @@ class TestSphericalHarmonicTransform(unittest.TestCase):
 
         self.assertTrue(compare_tensors("compiled forward", actual, expected, atol=1e-5, rtol=1e-5, verbose=verbose))
         self.assertTrue(compare_tensors("compiled backward", actual_grad, expected_grad, atol=1e-5, rtol=1e-5, verbose=verbose))
+
+
+@parameterized_class(("device"), _devices)
+class TestExtendedEquiangularSHT(unittest.TestCase):
+    """Focused coverage for runtime extended analysis."""
+
+    def setUp(self):
+        disable_tf32()
+
+    def test_public_api_limits_and_grid_regressions(self):
+        for cls in (th.RealSHT, th.RealVectorSHT):
+            with self.subTest(cls=cls.__name__):
+                direct = cls(73, 144, lmax=37, mmax=37)
+                self.assertFalse(direct._resample_latitudes)
+                self.assertIn("weights", direct._buffers)
+                for name in ("_quadrature_weights", "_padded_midpoint_weights", "_latitude_shift_phase", "_parity_signs"):
+                    self.assertNotIn(name, direct._buffers)
+
+                resampled = cls(73, 144, lmax=38, mmax=38)
+                self.assertTrue(resampled._resample_latitudes)
+                self.assertIn("_quadrature_weights", resampled._buffers)
+                self.assertIn("_padded_midpoint_weights", resampled._buffers)
+                self.assertEqual(resampled._padded_midpoint_weights.shape, (2 * (resampled.nlat - 1),))
+
+                with self.assertRaisesRegex(ValueError, r"lmax <= 72.*mmax <= 72"):
+                    cls(73, 144, lmax=73, mmax=73)
+
+                # Inverse synthesis uses upstream truncation semantics.
+                inverse = (th.InverseRealSHT if cls is th.RealSHT else th.InverseRealVectorSHT)(73, 144, lmax=73, mmax=73)
+                self.assertEqual(inverse.lmax, 73)
+
+                trapezoidal = cls(
+                    17,
+                    32,
+                    lmax=16,
+                    mmax=16,
+                    grid="equiangular-trapezoidal",
+                )
+                self.assertFalse(trapezoidal._resample_latitudes)
+                spatial = torch.randn(2, 17, 32, device=self.device) if cls is th.RealSHT else torch.randn(2, 2, 17, 32, device=self.device)
+                self.assertEqual(tuple(trapezoidal.to(self.device)(spatial).shape), (2, 16, 16) if cls is th.RealSHT else (2, 2, 16, 16))
+
+    def test_midpoint_resampling_operator_adjoint(self):
+        nlat, mmax = 7, 4
+        for real_dtype, atol, rtol in ((torch.float32, 1e-5, 1e-5), (torch.float64, 1e-12, 1e-12)):
+            period = 2 * (nlat - 1)
+            frequencies = torch.fft.fftfreq(period, dtype=real_dtype, device=self.device)
+            phase = torch.polar(torch.ones_like(frequencies), torch.pi * frequencies)
+            real_x = torch.arange(2 * mmax * nlat, dtype=real_dtype, device=self.device).reshape(2, mmax, nlat) / 100.0
+            imag_x = real_x.flip(-1) / 7.0
+            x = torch.complex(real_x, imag_x)
+            real_y = torch.arange(2 * mmax * (nlat - 1), dtype=real_dtype, device=self.device).reshape(2, mmax, nlat - 1) / 80.0
+            imag_y = real_y.flip(-1) / 5.0
+            y = torch.complex(real_y, imag_y)
+
+            for parity_name, first_negative in (("scalar", 1), ("vector", 0)):
+                with self.subTest(dtype=real_dtype, parity=parity_name):
+                    signs = torch.ones(mmax, 1, dtype=torch.int8, device=self.device)
+                    signs[first_negative::2] = -1
+                    extended = _periodic_latitude_extension(x, signs)
+                    midpoint = _fourier_shift_latitude(extended, phase)[..., : nlat - 1]
+                    padded = torch.cat((y, torch.zeros_like(y)), dim=-1)
+                    adjoint = _periodic_latitude_extension_adjoint(_fourier_shift_latitude_adjoint(padded, phase), signs)
+                    lhs = torch.vdot(midpoint.reshape(-1), y.reshape(-1))
+                    rhs = torch.vdot(x.reshape(-1), adjoint.reshape(-1))
+                    torch.testing.assert_close(lhs, rhs, atol=atol, rtol=rtol)
+
+    def test_high_degree_representative_modes(self):
+        nlat, nlon, limit = 73, 144, 72
+        modes = [(70, 0), (70, 1), (70, 70), (71, 0), (71, 1), (71, 71)]
+
+        for real_dtype, complex_dtype in ((torch.float32, torch.complex64), (torch.float64, torch.complex128)):
+            scalar_coeffs = torch.zeros(len(modes), limit, limit, dtype=complex_dtype, device=self.device)
+            for index, (degree, order) in enumerate(modes):
+                value = 1.0 if order == 0 else 0.375 + 0.625j
+                scalar_coeffs[index, degree, order] = value
+
+            scalar_inverse = th.InverseRealSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+            vector_inverse = th.InverseRealVectorSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+            scalar_signal = scalar_inverse(scalar_coeffs)
+
+            atol = 5e-6 if real_dtype is torch.float32 else 1e-10
+            rtol = 5e-5 if real_dtype is torch.float32 else 1e-10
+            for channel, channel_name in enumerate(("spheroidal", "toroidal")):
+                vector_coeffs = torch.zeros(len(modes), 2, limit, limit, dtype=complex_dtype, device=self.device)
+                for index, (degree, order) in enumerate(modes):
+                    value = 1.0 if order == 0 else 0.375 + 0.625j
+                    vector_coeffs[index, channel, degree, order] = value
+                vector_signal = vector_inverse(vector_coeffs)
+
+                with self.subTest(dtype=real_dtype, channel=channel_name):
+                    scalar = th.RealSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+                    vector = th.RealVectorSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+                    self.assertTrue(compare_tensors("scalar high-degree modes", scalar(scalar_signal), scalar_coeffs, atol=atol, rtol=rtol))
+                    self.assertTrue(compare_tensors(f"vector {channel_name} high-degree modes", vector(vector_signal), vector_coeffs, atol=3 * atol, rtol=rtol))
+
+    def test_high_degree_random_triangular_spectra(self):
+        for real_dtype, complex_dtype in ((torch.float32, torch.complex64), (torch.float64, torch.complex128)):
+            for limit in (71, 72):
+                with self.subTest(dtype=real_dtype, limit=limit):
+                    scalar_coeffs = random_sht_coeffs(1, limit, limit, self.device).to(complex_dtype)
+                    vector_coeffs = torch.stack(
+                        (
+                            random_sht_coeffs(1, limit, limit, self.device, zero_l0=True).to(complex_dtype),
+                            random_sht_coeffs(1, limit, limit, self.device, zero_l0=True).to(complex_dtype),
+                        ),
+                        dim=1,
+                    )
+                    scalar_inverse = th.InverseRealSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+                    vector_inverse = th.InverseRealVectorSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+                    scalar_signal = scalar_inverse(scalar_coeffs)
+                    vector_signal = vector_inverse(vector_coeffs)
+                    scalar = th.RealSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+                    vector = th.RealVectorSHT(73, 144, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+                    scalar_error = (scalar(scalar_signal) - scalar_coeffs).abs()
+                    vector_error = (vector(vector_signal) - vector_coeffs).abs()
+                    if real_dtype is torch.float32:
+                        self.assertLessEqual(scalar_error.max().item(), 5e-6)
+                        self.assertLessEqual(vector_error.max().item(), 3e-5)
+                    else:
+                        self.assertLessEqual(scalar_error.max().item(), 1e-10)
+                        self.assertLessEqual(vector_error.max().item(), 3e-10)
+
+    def test_odd_longitude_high_degree_round_trip(self):
+        nlat, nlon, limit = 9, 15, 8
+        for real_dtype, complex_dtype in ((torch.float32, torch.complex64), (torch.float64, torch.complex128)):
+            scalar_coeffs = torch.zeros(1, limit, limit, dtype=complex_dtype, device=self.device)
+            scalar_coeffs[0, 7, 7] = 0.375 + 0.625j
+            vector_coeffs = torch.zeros(1, 2, limit, limit, dtype=complex_dtype, device=self.device)
+            vector_coeffs[0, 0, 7, 7] = 0.375 + 0.625j
+            vector_coeffs[0, 1, 6, 6] = -0.25 + 0.5j
+            scalar_inverse = th.InverseRealSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+            vector_inverse = th.InverseRealVectorSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+            scalar_signal = scalar_inverse(scalar_coeffs)
+            vector_signal = vector_inverse(vector_coeffs)
+            atol = 5e-6 if real_dtype is torch.float32 else 1e-10
+            rtol = 5e-5 if real_dtype is torch.float32 else 1e-10
+            scalar = th.RealSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+            vector = th.RealVectorSHT(nlat, nlon, lmax=limit, mmax=limit).to(device=self.device, dtype=real_dtype)
+            self.assertTrue(compare_tensors("odd-nlon scalar", scalar(scalar_signal), scalar_coeffs, atol=atol, rtol=rtol))
+            self.assertTrue(compare_tensors("odd-nlon vector", vector(vector_signal), vector_coeffs, atol=3 * atol, rtol=rtol))
+
+    def test_norm_and_csphase_runtime_correctness(self):
+        for norm in ("ortho", "four-pi", "schmidt"):
+            for csphase in (True, False):
+                with self.subTest(norm=norm, csphase=csphase):
+                    scalar_coeffs = random_sht_coeffs(2, 16, 16, self.device).to(torch.complex128)
+                    vector_coeffs = torch.stack(
+                        (
+                            random_sht_coeffs(2, 16, 16, self.device, zero_l0=True),
+                            random_sht_coeffs(2, 16, 16, self.device, zero_l0=True),
+                        ),
+                        dim=1,
+                    )
+                    scalar_inverse = th.InverseRealSHT(17, 32, lmax=16, mmax=16, norm=norm, csphase=csphase).to(self.device)
+                    vector_inverse = th.InverseRealVectorSHT(17, 32, lmax=16, mmax=16, norm=norm, csphase=csphase).to(self.device)
+                    scalar_signal = scalar_inverse(scalar_coeffs)
+                    vector_signal = vector_inverse(vector_coeffs)
+                    scalar_runtime = th.RealSHT(17, 32, lmax=16, mmax=16, norm=norm, csphase=csphase).to(self.device)
+                    vector_runtime = th.RealVectorSHT(17, 32, lmax=16, mmax=16, norm=norm, csphase=csphase).to(self.device)
+                    scalar_runtime_output = scalar_runtime(scalar_signal)
+                    vector_runtime_output = vector_runtime(vector_signal)
+                    self.assertTrue(compare_tensors("scalar runtime", scalar_runtime_output, scalar_coeffs, atol=1e-10, rtol=1e-10))
+                    self.assertTrue(compare_tensors("vector runtime", vector_runtime_output, vector_coeffs, atol=1e-10, rtol=1e-10))
+
+    def test_runtime_gradcheck(self):
+        for cls in (th.RealSHT, th.RealVectorSHT):
+            with self.subTest(cls=cls.__name__):
+                module = cls(6, 12, lmax=5, mmax=5).to(self.device).double()
+                shape = (1, 6, 12) if cls is th.RealSHT else (1, 2, 6, 12)
+                x = torch.randn(*shape, dtype=torch.float64, device=self.device, requires_grad=True)
+
+                def loss(value):
+                    output = module(value)
+                    return output.real.square().mean() + output.imag.square().mean()
+
+                self.assertTrue(gradcheck(loss, (x,), eps=1e-6, atol=1e-8, rtol=1e-6))
+
+    def test_runtime_compile_forward_and_backward(self):
+        for cls in (th.RealSHT, th.RealVectorSHT):
+            with self.subTest(cls=cls.__name__):
+                module = cls(9, 16, lmax=8, mmax=8).to(self.device).float()
+                inverse_cls = th.InverseRealSHT if cls is th.RealSHT else th.InverseRealVectorSHT
+                inverse = inverse_cls(9, 16, lmax=8, mmax=8).to(self.device).float()
+                shape = (1, 9, 16) if cls is th.RealSHT else (1, 2, 9, 16)
+                x = torch.randn(*shape, dtype=torch.float32, device=self.device, requires_grad=True)
+
+                def fn(value):
+                    return inverse(module(value))
+
+                eager_output = fn(x)
+                gradient = torch.randn_like(eager_output)
+                (eager_gradient,) = torch.autograd.grad(eager_output, x, grad_outputs=gradient)
+
+                compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+                compiled_output = compiled(x)
+                (compiled_gradient,) = torch.autograd.grad(compiled_output, x, grad_outputs=gradient)
+                torch.testing.assert_close(compiled_output, eager_output, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(compiled_gradient, eager_gradient, rtol=1e-5, atol=1e-5)
 
 
 @parameterized_class(("device"), _devices)
