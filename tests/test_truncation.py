@@ -9,7 +9,12 @@ import torch
 from testutils import compare_tensors
 
 import torch_harmonics as th
-from torch_harmonics.truncation import _sht_truncation_mask
+
+
+def rhomboidal_support(lmax, mmax):
+    m = torch.arange(mmax).view(-1, 1)
+    l = torch.arange(lmax).view(1, -1)
+    return (m <= l) & (l - m <= lmax - mmax)
 
 
 class TestSHTTruncation(unittest.TestCase):
@@ -44,8 +49,8 @@ class TestSHTTruncation(unittest.TestCase):
                     expected,
                 )
 
-    def test_rhomboidal_bounds_and_global_offsets(self):
-        lmax, mmax = 9, 5  # standard R4 in torch-harmonics' non-inclusive limits
+    def test_l_minus_m_restriction(self):
+        lmax, mmax = 9, 5  # R4 in non-inclusive limits
         self.assertEqual(
             th.truncate_sht(16, 32, lmax=lmax, mmax=mmax, grid="legendre-gauss", truncation="rhomboidal"),
             (lmax, mmax),
@@ -55,25 +60,18 @@ class TestSHTTruncation(unittest.TestCase):
             (5, 5),
         )
 
-        support = _sht_truncation_mask(lmax, mmax, "rhomboidal")
-        self.assertTrue(support[0, 4])  # (l=4, m=0), l-m=N
-        self.assertTrue(support[4, 8])  # (l=8, m=4), l-m=N
-        self.assertFalse(support[0, 5])  # (l=5, m=0), just outside the edge
-        self.assertFalse(support[3, 8])  # (l=8, m=3), just outside the edge
-
-        local = _sht_truncation_mask(
-            lmax,
-            mmax,
-            "rhomboidal",
-            mmin=3,
-            lmin=4,
-            local_mmax=5,
-            local_lmax=9,
-        )
+        support = rhomboidal_support(lmax, mmax)
+        self.assertTrue(support[0, 4])  # (l=4, m=0)
+        self.assertTrue(support[4, 8])  # (l=8, m=4)
+        self.assertFalse(support[0, 5])  # (l=5, m=0)
+        self.assertFalse(support[3, 8])  # (l=8, m=3)
+        m_local = torch.arange(3, mmax).view(-1, 1)
+        l_local = torch.arange(4, lmax).view(1, -1)
+        local = (m_local <= l_local) & (l_local - m_local <= lmax - mmax)
         self.assertTrue(torch.equal(local, support[3:, 4:]))
 
     def test_invalid_truncation(self):
-        with self.assertRaisesRegex(ValueError, "triangular.*trapezoidal"):
+        with self.assertRaisesRegex(ValueError, "triangular.*trapezoidal.*rhomboidal"):
             th.truncate_sht(16, 32, truncation="invalid")
 
     def test_scalar_trapezoidal_round_trip(self, verbose=False):
@@ -97,7 +95,7 @@ class TestSHTTruncation(unittest.TestCase):
     def test_scalar_rhomboidal_support(self, verbose=False):
         nlat, nlon = 16, 32
         lmax, mmax = 9, 5
-        support = _sht_truncation_mask(lmax, mmax, "rhomboidal").transpose(0, 1)
+        support = rhomboidal_support(lmax, mmax).transpose(0, 1)
 
         sht = th.RealSHT(nlat, nlon, lmax=lmax, mmax=mmax, grid="legendre-gauss", truncation="rhomboidal")
         isht = th.InverseRealSHT(nlat, nlon, lmax=lmax, mmax=mmax, grid="legendre-gauss", truncation="rhomboidal")
@@ -113,17 +111,17 @@ class TestSHTTruncation(unittest.TestCase):
         with torch.no_grad():
             actual = isht(coeffs)
             reference = isht(zeroed)
-        self.assertTrue(compare_tensors("invalid scalar inverse modes", actual, reference, atol=1e-12, rtol=1e-12, verbose=verbose))
+        self.assertTrue(compare_tensors("invalid scalar inverse modes", reference, actual, atol=1e-12, rtol=1e-12, verbose=verbose))
 
         with torch.no_grad():
             round_trip = sht(isht(zeroed))
             random_output = sht(torch.randn(1, nlat, nlon, dtype=torch.float64))
-        self.assertTrue(compare_tensors("retained scalar boundary modes", round_trip[..., support], zeroed[..., support], atol=1e-9, rtol=1e-9, verbose=verbose))
+        self.assertTrue(compare_tensors("retained scalar boundary modes", zeroed[..., support], round_trip[..., support], atol=1e-9, rtol=1e-9, verbose=verbose))
         self.assertTrue(
             compare_tensors(
                 "scalar forward outside rhomboid",
-                random_output[..., ~support],
                 torch.zeros_like(random_output[..., ~support]),
+                random_output[..., ~support],
                 atol=1e-12,
                 rtol=0.0,
                 verbose=verbose,
@@ -152,16 +150,16 @@ class TestSHTTruncation(unittest.TestCase):
     def test_vector_rhomboidal_support_and_halo(self, verbose=False):
         nlat, nlon = 16, 32
         lmax, mmax = 9, 5
-        support = _sht_truncation_mask(lmax, mmax, "rhomboidal").transpose(0, 1)
+        support = rhomboidal_support(lmax, mmax).transpose(0, 1)
 
         sht = th.RealVectorSHT(nlat, nlon, lmax=lmax, mmax=mmax, grid="legendre-gauss", truncation="rhomboidal")
         isht = th.InverseRealVectorSHT(nlat, nlon, lmax=lmax, mmax=mmax, grid="legendre-gauss", truncation="rhomboidal")
 
         coeffs = torch.zeros(1, 2, lmax, mmax, dtype=torch.complex128)
-        coeffs[0, 0, 8, 4] = 1.0 + 0.25j  # retained high-degree/high-order boundary
+        coeffs[0, 0, 8, 4] = 1.0 + 0.25j  # retained boundary mode
         coeffs[0, 1, 8, 4] = -0.5 + 0.75j
-        coeffs[0, 0, 5, 0] = 3.0 - 2.0j  # invalid because l-m=N+1
-        coeffs[0, 1, 8, 3] = -4.0 + 1.5j  # invalid because l-m=N+1
+        coeffs[0, 0, 5, 0] = 3.0 - 2.0j  # l - m = N + 1
+        coeffs[0, 1, 8, 3] = -4.0 + 1.5j  # l - m = N + 1
         zeroed = coeffs.clone()
         zeroed[..., ~support] = 0.0
 
@@ -170,13 +168,13 @@ class TestSHTTruncation(unittest.TestCase):
             reference = isht(zeroed)
             round_trip = sht(reference)
             random_output = sht(torch.randn(1, 2, nlat, nlon, dtype=torch.float64))
-        self.assertTrue(compare_tensors("invalid vector inverse modes", actual, reference, atol=1e-12, rtol=1e-12, verbose=verbose))
-        self.assertTrue(compare_tensors("retained vector boundary modes", round_trip[..., support], zeroed[..., support], atol=1e-7, rtol=1e-7, verbose=verbose))
+        self.assertTrue(compare_tensors("invalid vector inverse modes", reference, actual, atol=1e-12, rtol=1e-12, verbose=verbose))
+        self.assertTrue(compare_tensors("retained vector boundary modes", zeroed[..., support], round_trip[..., support], atol=1e-7, rtol=1e-7, verbose=verbose))
         self.assertTrue(
             compare_tensors(
                 "vector forward outside rhomboid",
-                random_output[..., ~support],
                 torch.zeros_like(random_output[..., ~support]),
+                random_output[..., ~support],
                 atol=1e-12,
                 rtol=0.0,
                 verbose=verbose,

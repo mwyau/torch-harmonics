@@ -181,12 +181,9 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             # trapezoidal truncation
             [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "trapezoidal"],
             [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "trapezoidal"],
-            # standard R7: lmax=15, mmax=8 in the dense non-inclusive layout
-            [32, 64, 15, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
-            # The vector inverse gradient includes high-degree derivative factors and reaches
-            # O(1e3) for this batch; polar reduction reassociation is O(1e-4) in absolute fp32
-            # terms, so use the corresponding dynamic-range-scaled floor here.
-            [32, 64, 15, 32, 8, "legendre-gauss", True, 1e-4, 1e-6, 8, "rhomboidal"],
+            # evenly divisible R8: lmax=16, mmax=8
+            [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
+            [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "rhomboidal"],
         ],
         skip_on_empty=True,
     )
@@ -339,10 +336,10 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             # trapezoidal truncation
             [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "trapezoidal"],
             [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "trapezoidal"],
-            # standard R7: lmax=15, mmax=8 in the dense non-inclusive layout
-            [32, 64, 15, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
-            # See the matching forward-row comment above for the dynamic-range-scaled floor.
-            [32, 64, 15, 32, 8, "legendre-gauss", True, 1e-4, 1e-6, 8, "rhomboidal"],
+            # evenly divisible R8: lmax=16, mmax=8
+            [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
+            # Two-rank polar reduction changes the high-degree vector inverse gradient by O(1e-5).
+            [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-4, 1e-6, 8, "rhomboidal"],
         ],
         skip_on_empty=True,
     )
@@ -440,8 +437,8 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             [32, 64, None, "equiangular", True],
             [33, 64, None, "legendre-gauss", True],
             [32, 64, 8, "equiangular", True],
-            [32, 64, 15, "legendre-gauss", False, 8, "rhomboidal"],
-            [32, 64, 15, "legendre-gauss", True, 8, "rhomboidal"],
+            [32, 64, 16, "legendre-gauss", False, 8, "rhomboidal"],
+            [32, 64, 16, "legendre-gauss", True, 8, "rhomboidal"],
         ],
         skip_on_empty=True,
     )

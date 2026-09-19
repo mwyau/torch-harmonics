@@ -39,7 +39,6 @@ from torch.autograd import gradcheck
 
 import torch_harmonics as th
 from torch_harmonics.quadrature import precompute_latitudes
-from torch_harmonics.truncation import _sht_support_mask
 
 _devices = [(torch.device("cpu"),)]
 if torch.cuda.is_available():
@@ -283,26 +282,25 @@ class TestLegendrePolynomials(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # triangular, trapezoidal, and rhomboidal mathematical support
+            # triangular, trapezoidal, and rhomboidal support
             [9, 9, None],
             [5, 9, None],
             [5, 9, 4],
         ],
         skip_on_empty=True,
     )
-    def test_degree_order_gap_restriction(self, mmax, lmax, max_degree_order_gap, verbose=False):
-        """Gap-aware tables match unrestricted tables on every retained entry.
+    def test_l_minus_m_restriction(self, mmax, lmax, l_minus_m_max, verbose=False):
+        """Restricted tables match unrestricted tables on retained modes.
 
         The nonzero order and degree offsets exercise the same restricted blocks
         used by distributed forward and inverse transforms. The derivative case
-        also verifies that its underlying Legendre table keeps the required
-        two-mode halo while the returned table is masked to the requested gap.
+        verifies the required two-diagonal halo.
         """
 
         nlat = 2 * lmax
         t, _ = precompute_latitudes(nlat, grid="legendre-gauss")
         t = t.to(self.device)
-        gap_kwargs = {} if max_degree_order_gap is None else {"max_degree_order_gap": max_degree_order_gap}
+        restriction = {} if l_minus_m_max is None else {"l_minus_m_max": l_minus_m_max}
 
         for fn in (th.legendre.legpoly, th.legendre.dlegpoly):
             nodes = torch.cos(t) if fn is th.legendre.legpoly else t
@@ -322,24 +320,22 @@ class TestLegendrePolynomials(unittest.TestCase):
                                 csphase=csphase,
                                 mmin=mmin,
                                 lmin=lmin,
-                                **gap_kwargs,
+                                **restriction,
                             )
                             ref = full[..., mmin:, lmin:, :]
-                            support = _sht_support_mask(
-                                lmax,
-                                mmax,
-                                mmin=mmin,
-                                lmin=lmin,
-                                max_degree_order_gap=max_degree_order_gap,
-                            )
-                            case = f"{fn.__name__} mmax={mmax} lmax={lmax} gap={max_degree_order_gap} mmin={mmin} lmin={lmin} {norm} inverse={inverse} csphase={csphase}"
+                            m = torch.arange(mmin, mmax).view(-1, 1)
+                            l = torch.arange(lmin, lmax).view(1, -1)
+                            support = m <= l
+                            if l_minus_m_max is not None:
+                                support &= l - m <= l_minus_m_max
+                            case = f"{fn.__name__} mmax={mmax} lmax={lmax} l_minus_m_max={l_minus_m_max} mmin={mmin} lmin={lmin} {norm} inverse={inverse} csphase={csphase}"
                             if fn is th.legendre.legpoly:
                                 retained, expected = block[support], ref[support]
                                 outside = block[~support]
                             else:
                                 retained, expected = block[:, support], ref[:, support]
                                 outside = block[:, ~support]
-                            ok = compare_tensors(case, retained, expected.contiguous(), atol=0.0, rtol=0.0, verbose=verbose)
+                            ok = compare_tensors(case, expected.contiguous(), retained, atol=0.0, rtol=0.0, verbose=verbose)
                             self.assertTrue(ok, msg=f"values differ on retained support: {case}")
                             self.assertTrue(torch.equal(outside, torch.zeros_like(outside)), msg=f"nonzero outside support: {case}")
 

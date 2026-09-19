@@ -35,7 +35,7 @@ import torch.nn as nn
 from torch_harmonics.fft import irfft, rfft
 from torch_harmonics.legendre import _precompute_dlegpoly, _precompute_legpoly
 from torch_harmonics.quadrature import precompute_latitudes
-from torch_harmonics.truncation import _sht_truncation_gap, _sht_truncation_mask, truncate_sht
+from torch_harmonics.truncation import _sht_l_minus_m_max, truncate_sht
 from torch_harmonics.utils import check
 
 
@@ -83,8 +83,8 @@ class RealSHT(nn.Module):
         by default ``True``.
     truncation : str
         Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal and
-        rhomboidal truncation keep independent degree and order limits.
+        ``"rhomboidal"``), by default ``"triangular"``. Rhomboidal
+        truncation retains modes with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -140,9 +140,8 @@ class RealSHT(nn.Module):
         # here is exact and saves a pointwise multiply on a complex tensor in every forward.
         weights = 2.0 * torch.pi * weights
 
-        # combine quadrature weights with the Legendre weights. The mask is a
-        # construction-time backstop: the runtime contraction remains dense.
-        max_gap = _sht_truncation_gap(self.lmax, self.mmax, self.truncation)
+        # combine quadrature weights with the Legendre weights
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         pct = _precompute_legpoly(
             self.mmax,
             self.lmax,
@@ -150,9 +149,8 @@ class RealSHT(nn.Module):
             self.grid,
             norm=self.norm,
             csphase=self.csphase,
-            max_degree_order_gap=max_gap,
+            l_minus_m_max=l_minus_m_max,
         )
-        pct.mul_(_sht_truncation_mask(self.lmax, self.mmax, self.truncation, device=pct.device).unsqueeze(-1))
         weights = torch.einsum("mlk,k->mlk", pct, weights).contiguous()
 
         # remember quadrature weights
@@ -240,8 +238,8 @@ class InverseRealSHT(nn.Module):
         by default ``True``.
     truncation : str
         Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal and
-        rhomboidal truncation keep independent degree and order limits.
+        ``"rhomboidal"``), by default ``"triangular"``. Rhomboidal
+        truncation retains modes with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -300,7 +298,7 @@ class InverseRealSHT(nn.Module):
 
         # precompute associated Legendre polynomials
         # store as (mmax, nlat, lmax) so the contraction dim l is stride-1
-        max_gap = _sht_truncation_gap(self.lmax, self.mmax, self.truncation)
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         pct = _precompute_legpoly(
             self.mmax,
             self.lmax,
@@ -309,9 +307,8 @@ class InverseRealSHT(nn.Module):
             norm=self.norm,
             inverse=True,
             csphase=self.csphase,
-            max_degree_order_gap=max_gap,
+            l_minus_m_max=l_minus_m_max,
         )
-        pct.mul_(_sht_truncation_mask(self.lmax, self.mmax, self.truncation, device=pct.device).unsqueeze(-1))
         pct = pct.permute(0, 2, 1).contiguous()
 
         # register buffer
@@ -397,8 +394,8 @@ class RealVectorSHT(nn.Module):
         by default ``True``.
     truncation : str
         Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal and
-        rhomboidal truncation keep independent degree and order limits.
+        ``"rhomboidal"``), by default ``"triangular"`. Rhomboidal
+        truncation retains modes with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -448,7 +445,7 @@ class RealVectorSHT(nn.Module):
         self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
 
         # precompute associated Legendre polynomials
-        max_gap = _sht_truncation_gap(self.lmax, self.mmax, self.truncation)
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax,
             self.lmax,
@@ -456,9 +453,8 @@ class RealVectorSHT(nn.Module):
             self.grid,
             norm=self.norm,
             csphase=self.csphase,
-            max_degree_order_gap=max_gap,
+            l_minus_m_max=l_minus_m_max,
         )
-        dpct.mul_(_sht_truncation_mask(self.lmax, self.mmax, self.truncation, device=dpct.device).unsqueeze(0).unsqueeze(-1))
 
         # fold the 2*pi longitudinal scale factor of the forward-normalized FFT into the
         # quadrature weights (see RealSHT.__init__)
@@ -568,8 +564,8 @@ class InverseRealVectorSHT(nn.Module):
         by default ``True``.
     truncation : str
         Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal and
-        rhomboidal truncation keep independent degree and order limits.
+        ``"rhomboidal"``), by default ``"triangular"``. Rhomboidal
+        truncation retains modes with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -623,7 +619,7 @@ class InverseRealVectorSHT(nn.Module):
 
         # precompute associated Legendre polynomials
         # store as (2, mmax, nlat, lmax) so the contraction dim l is stride-1
-        max_gap = _sht_truncation_gap(self.lmax, self.mmax, self.truncation)
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax,
             self.lmax,
@@ -632,9 +628,8 @@ class InverseRealVectorSHT(nn.Module):
             norm=self.norm,
             inverse=True,
             csphase=self.csphase,
-            max_degree_order_gap=max_gap,
+            l_minus_m_max=l_minus_m_max,
         )
-        dpct.mul_(_sht_truncation_mask(self.lmax, self.mmax, self.truncation, device=dpct.device).unsqueeze(0).unsqueeze(-1))
         dpct = dpct.permute(0, 1, 3, 2).contiguous()
 
         # register weights

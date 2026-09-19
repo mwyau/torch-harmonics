@@ -456,6 +456,10 @@ def _gather(input_, dim_, shapes_, group=None, verify_shapes=None):
         sizes_gather = [stens.item() for stens in stens_gather]
         _check_shapes("_gather: error, shapes_", sizes_gather, shapes_)
 
+    # make contiguous:
+    input_ = input_.contiguous()
+    input_shape = list(input_.shape)
+
     if shapes_ is None:
         # gather shapes across ranks
         comm_rank = dist.get_rank(group=group)
@@ -465,36 +469,17 @@ def _gather(input_, dim_, shapes_, group=None, verify_shapes=None):
         dist.all_gather(stens_gather, stens, group=group)
         shapes_ = [stens.item() for stens in stens_gather]
 
-    # all_gather requires equal input and output shapes, while the distributed
-    # SHT split can differ by one element when a spectral extent is not evenly
-    # divisible by the process-group size. Pad the local chunk to the largest
-    # chunk for this existing collective, then trim each received chunk below.
-    input_ = input_.contiguous()
-    comm_rank = dist.get_rank(group=group)
-    if input_.size(dim_) != shapes_[comm_rank]:
-        raise ValueError(f"Error, input shape {input_.size(dim_)} does not match expected local shape {shapes_[comm_rank]}.")
-    max_chunk = max(shapes_)
-    if input_.size(dim_) != max_chunk:
-        padded_shape = list(input_.shape)
-        padded_shape[dim_] = max_chunk
-        padded = torch.zeros(padded_shape, dtype=input_.dtype, device=input_.device)
-        local_slice = [slice(None)] * input_.dim()
-        local_slice[dim_] = slice(0, input_.size(dim_))
-        padded[tuple(local_slice)] = input_
-        input_ = padded
-
-    # now create the equal-sized receive list
-    input_shape = list(input_.shape)
-    input_shape[dim_] = max_chunk
+    # now create the recv list
     input_list = []
-    for _ in range(comm_size):
+    for src in range(comm_size):
+        input_shape[dim_] = shapes_[src]
         input_list.append(torch.empty(input_shape, dtype=input_.dtype, device=input_.device))
 
     # gather data across ranks
     dist.all_gather(input_list, input_, group=group)
 
-    # trim padding before concatenating along dim
-    output = torch.cat([chunk.narrow(dim_, 0, shapes_[src]) for src, chunk in enumerate(input_list)], dim=dim_)
+    # concatenate along dim
+    output = torch.cat(input_list, dim=dim_)
 
     return output
 

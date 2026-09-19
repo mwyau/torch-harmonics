@@ -32,8 +32,6 @@
 import warnings
 from typing import Optional, Tuple
 
-import torch
-
 
 def _truncate_lmax(nlat: int, grid: Optional[str] = "equiangular") -> int:
     """
@@ -159,9 +157,8 @@ def truncate_sht(
         ``"equiangular-trapezoidal"``), by default ``"equiangular"``.
     truncation : str, optional
         Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal and
-        rhomboidal truncation keep independent degree and order limits.
-        Rhomboidal support uses the non-inclusive dense limits: for a standard
+        ``"rhomboidal"``), by default ``"triangular"``. Rhomboidal
+        truncation retains modes with ``l - m <= lmax - mmax``. For standard
         atmospheric ``R42``, pass ``lmax=85``, ``mmax=43``.
 
     Returns
@@ -202,81 +199,11 @@ def truncate_sht(
     return lmax, mmax
 
 
-def _sht_truncation_gap(lmax: int, mmax: int, truncation: str) -> Optional[int]:
-    """Return the maximum allowed degree-order gap for an SHT truncation."""
+def _sht_l_minus_m_max(lmax: int, mmax: int, truncation: str) -> Optional[int]:
+    """Return the maximum retained value of ``l - m``."""
 
     if truncation in ("triangular", "trapezoidal"):
         return None
     if truncation == "rhomboidal":
         return lmax - mmax
     raise ValueError(f"Unknown truncation mode {truncation!r}; supported modes are 'triangular', 'trapezoidal', and 'rhomboidal'")
-
-
-def _sht_truncation_order_bounds(
-    l: int,
-    mmax: int,
-    *,
-    mmin: int = 0,
-    max_degree_order_gap: Optional[int] = None,
-) -> Tuple[int, int]:
-    """Return the inclusive supported order range for one global degree."""
-
-    if max_degree_order_gap is None:
-        m_lo = mmin
-    else:
-        m_lo = max(mmin, l - max_degree_order_gap)
-    return m_lo, min(mmax - 1, l)
-
-
-def _sht_support_mask(
-    lmax: int,
-    mmax: int,
-    *,
-    mmin: int = 0,
-    lmin: int = 0,
-    local_mmax: Optional[int] = None,
-    local_lmax: Optional[int] = None,
-    max_degree_order_gap: Optional[int] = None,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Build a dense support mask for a global ``(l, m)`` block."""
-
-    local_mmax = mmax if local_mmax is None else local_mmax
-    local_lmax = lmax if local_lmax is None else local_lmax
-
-    m = torch.arange(mmin, local_mmax, device=device).view(-1, 1)
-    l = torch.arange(lmin, local_lmax, device=device).view(1, -1)
-    mask = m <= l
-    if max_degree_order_gap is not None:
-        mask &= l - m <= max_degree_order_gap
-    return mask
-
-
-def _sht_truncation_mask(
-    lmax: int,
-    mmax: int,
-    truncation: str,
-    *,
-    mmin: int = 0,
-    lmin: int = 0,
-    local_mmax: Optional[int] = None,
-    local_lmax: Optional[int] = None,
-    device: Optional[torch.device] = None,
-) -> torch.Tensor:
-    """Build the support mask for a dense local SHT block.
-
-    ``mmin`` and ``lmin`` are global offsets. The returned mask is indexed by
-    the local block, while its support condition is evaluated with global
-    degree and order indices.
-    """
-
-    return _sht_support_mask(
-        lmax,
-        mmax,
-        mmin=mmin,
-        lmin=lmin,
-        local_mmax=local_mmax,
-        local_lmax=local_lmax,
-        max_degree_order_gap=_sht_truncation_gap(lmax, mmax, truncation),
-        device=device,
-    )
