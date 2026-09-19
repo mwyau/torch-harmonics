@@ -38,6 +38,7 @@ from testutils import compare_tensors, disable_tf32, set_seed
 from torch.autograd import gradcheck
 
 import torch_harmonics as th
+from torch_harmonics.legendre import _dlegpoly, _legpoly
 from torch_harmonics.quadrature import precompute_latitudes
 
 _devices = [(torch.device("cpu"),)]
@@ -302,12 +303,12 @@ class TestLegendrePolynomials(unittest.TestCase):
         t = t.to(self.device)
         restriction = {} if l_minus_m_max is None else {"l_minus_m_max": l_minus_m_max}
 
-        for fn in (th.legendre.legpoly, th.legendre.dlegpoly):
-            nodes = torch.cos(t) if fn is th.legendre.legpoly else t
+        for fn, public_fn in ((_legpoly, th.legendre.legpoly), (_dlegpoly, th.legendre.dlegpoly)):
+            nodes = torch.cos(t) if public_fn is th.legendre.legpoly else t
             for norm in ["ortho", "four-pi", "schmidt"]:
                 for inverse in [False, True]:
                     for csphase in [False, True]:
-                        full = fn(mmax, lmax, nodes, norm=norm, inverse=inverse, csphase=csphase)
+                        full = public_fn(mmax, lmax, nodes, norm=norm, inverse=inverse, csphase=csphase)
                         for mmin, lmin in [(0, 0), (1, 2), (mmax // 2, lmax // 2)]:
                             if mmin >= mmax or lmin >= lmax:
                                 continue
@@ -327,9 +328,10 @@ class TestLegendrePolynomials(unittest.TestCase):
                             l = torch.arange(lmin, lmax).view(1, -1)
                             support = m <= l
                             if l_minus_m_max is not None:
-                                support &= l - m <= l_minus_m_max
-                            case = f"{fn.__name__} mmax={mmax} lmax={lmax} l_minus_m_max={l_minus_m_max} mmin={mmin} lmin={lmin} {norm} inverse={inverse} csphase={csphase}"
-                            if fn is th.legendre.legpoly:
+                                N = l_minus_m_max
+                                support &= l - m <= N
+                            case = f"{public_fn.__name__} mmax={mmax} lmax={lmax} l_minus_m_max={l_minus_m_max} mmin={mmin} lmin={lmin} {norm} inverse={inverse} csphase={csphase}"
+                            if public_fn is th.legendre.legpoly:
                                 retained, expected = block[support], ref[support]
                                 outside = block[~support]
                             else:

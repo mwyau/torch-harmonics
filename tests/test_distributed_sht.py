@@ -181,7 +181,7 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             # trapezoidal truncation
             [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "trapezoidal"],
             [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "trapezoidal"],
-            # evenly divisible R8: lmax=16, mmax=8
+            # N=8, M=7; both dense dimensions split evenly
             [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
             [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "rhomboidal"],
         ],
@@ -336,7 +336,7 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             # trapezoidal truncation
             [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "trapezoidal"],
             [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "trapezoidal"],
-            # evenly divisible R8: lmax=16, mmax=8
+            # N=8, M=7; both dense dimensions split evenly
             [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
             # Two-rank polar reduction changes the high-degree vector inverse gradient by O(1e-5).
             [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-4, 1e-6, 8, "rhomboidal"],

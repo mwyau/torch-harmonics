@@ -70,6 +70,24 @@ class TestSHTTruncation(unittest.TestCase):
         local = (m_local <= l_local) & (l_local - m_local <= lmax - mmax)
         self.assertTrue(torch.equal(local, support[3:, 4:]))
 
+    def test_rhomboidal_requires_explicit_bounds(self):
+        for bounds in ({}, {"lmax": 16}, {"mmax": 8}):
+            with self.subTest(bounds=bounds):
+                with self.assertRaisesRegex(ValueError, "Rhomboidal truncation requires explicit lmax and mmax"):
+                    th.truncate_sht(16, 32, truncation="rhomboidal", **bounds)
+
+        self.assertEqual(
+            th.truncate_sht(
+                16,
+                32,
+                lmax=9,
+                mmax=5,
+                grid="legendre-gauss",
+                truncation="rhomboidal",
+            ),
+            (9, 5),
+        )
+
     def test_invalid_truncation(self):
         with self.assertRaisesRegex(ValueError, "triangular.*trapezoidal.*rhomboidal"):
             th.truncate_sht(16, 32, truncation="invalid")

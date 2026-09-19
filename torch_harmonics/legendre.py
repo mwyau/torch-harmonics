@@ -44,7 +44,7 @@ def clm(l: int, m: int) -> float:
 
 
 @torch.no_grad()
-def legpoly(
+def _legpoly(
     mmax: int,
     lmax: int,
     x: torch.Tensor,
@@ -97,8 +97,7 @@ def legpoly(
     lmin : Optional[int]
         First degree to store, by default 0
     l_minus_m_max : Optional[int]
-        Optional maximum value of ``l - m`` to evaluate and store. ``None``
-        retains the unrestricted recurrence.
+        Optional global maximum value of ``l - m`` to evaluate and store.
 
     Returns
     -------
@@ -197,6 +196,7 @@ def legpoly(
                 prev2, prev1, cur = prev1, cur, prev2
                 diag = diag_l
     else:
+        # The boundary is global; mmin/lmin only describe the stored local block.
         for l in range(lmax):
             if l == 0:
                 diag_l = torch.full((nk,), norm_factor / math.sqrt(4 * math.pi), dtype=torch.float64, device=x.device)
@@ -241,6 +241,87 @@ def legpoly(
         out[(1 if mmin % 2 == 0 else 0) :: 2] *= -1
 
     return out
+
+
+@torch.no_grad()
+def legpoly(
+    mmax: int,
+    lmax: int,
+    x: torch.Tensor,
+    norm: Optional[str] = "ortho",
+    inverse: Optional[bool] = False,
+    csphase: Optional[bool] = True,
+    *,
+    mmin: Optional[int] = 0,
+    lmin: Optional[int] = 0,
+) -> torch.Tensor:
+    """
+    Computes the values of (-1)^m c^l_m P^l_m(x) at the positions specified by x.
+    The resulting tensor has shape (mmax - mmin, lmax - lmin, len(x)). The Condon-Shortley
+    Phase (-1)^m can be turned off optionally.
+
+    The three-term recurrence has a sequential dependence in degree ``l`` (each ``l``
+    reads ``l-1`` and ``l-2``), but for fixed ``l`` all orders ``m`` are independent;
+    the inner ``m``-loop is therefore vectorized as a single tensor op, turning what
+    would be O(nmax^2) kernel launches into O(nmax).
+
+    Because of that dependence structure the degree axis is *streamed* rather than
+    materialized: only the two previous degrees are carried, so the working set is
+    O((mmax - mmin) * len(x)) instead of the O(mmax * lmax * len(x)) table. This is what
+    lets a distributed transform build only the block it stores, rather than building
+    the whole table and discarding most of it.
+
+    ``mmin`` and ``lmin`` restrict which orders and degrees are *stored*, not which are
+    *computed*. Both recurrences have to be walked from the start regardless:
+    ``P^m_m`` is reached from ``P^{m-1}_{m-1}``, and ``P^m_l`` from ``P^m_{l-1}``. Only
+    the evaluation points are free of this -- they are mutually independent, so
+    restricting them needs no argument here, just a shorter ``x``.
+
+    Parameters
+    ----------
+    mmax : int
+        Maximum order of the spherical harmonics (exclusive)
+    lmax : int
+        Maximum degree of the spherical harmonics (exclusive)
+    x : torch.Tensor
+        Tensor of positions at which to evaluate the Legendre polynomials
+    norm : Optional[str]
+        Normalization of the Legendre polynomials
+    inverse : Optional[bool]
+        Whether to compute the inverse Legendre polynomials
+    csphase : Optional[bool]
+        Whether to apply the Condon-Shortley phase (-1)^m
+    mmin : Optional[int]
+        First order to store, by default 0
+    lmin : Optional[int]
+        First degree to store, by default 0
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of Legendre polynomial values, shape ``(mmax - mmin, lmax - lmin, len(x))``
+
+    Raises
+    ------
+    ValueError
+        If the requested order or degree range is not a valid half-open interval
+
+    References
+    ----------
+    :cite:`Schaeffer2013`, :cite:`Rapp1982`, :cite:`Schrama1984`
+    """
+
+    return _legpoly(
+        mmax,
+        lmax,
+        x,
+        norm=norm,
+        inverse=inverse,
+        csphase=csphase,
+        mmin=mmin,
+        lmin=lmin,
+        l_minus_m_max=None,
+    )
 
 
 @lru_cache(typed=True, copy=True)
@@ -298,7 +379,7 @@ def _precompute_legpoly(
         degree ranges, restricting latitudes costs nothing: they are independent of one
         another, so the excluded ones are never computed in the first place.
     l_minus_m_max : Optional[int]
-        Optional maximum value of ``l - m`` passed to :func:`legpoly`.
+        Optional maximum value of ``l - m`` passed to :func:`_legpoly`.
 
     Returns
     -------
@@ -309,7 +390,7 @@ def _precompute_legpoly(
     lats, _ = precompute_latitudes(nlat, grid=grid)
     kmax = nlat if kmax is None else kmax
 
-    return legpoly(
+    return _legpoly(
         mmax,
         lmax,
         torch.cos(lats[kmin:kmax]),
@@ -323,7 +404,7 @@ def _precompute_legpoly(
 
 
 @torch.no_grad()
-def dlegpoly(
+def _dlegpoly(
     mmax: int,
     lmax: int,
     t: torch.Tensor,
@@ -366,7 +447,7 @@ def dlegpoly(
     lmin : Optional[int]
         First degree to store, by default 0
     l_minus_m_max : Optional[int]
-        Optional maximum value of ``l - m`` to retain in the output. The
+        Optional global maximum value of ``l - m`` to retain in the output. The
         underlying Legendre table uses ``l_minus_m_max + 2`` because the
         derivative formulas read ``(l + 1, m - 1)``.
 
@@ -383,7 +464,7 @@ def dlegpoly(
     # dlegpoly reads (l + 1, m - 1), so the Legendre table needs two
     # additional l - m diagonals.
     pmin = max(0, mmin - 1)
-    pct = legpoly(
+    pct = _legpoly(
         mmax + 1,
         lmax + 1,
         torch.cos(t),
@@ -462,6 +543,73 @@ def dlegpoly(
     return dpct
 
 
+@torch.no_grad()
+def dlegpoly(
+    mmax: int,
+    lmax: int,
+    t: torch.Tensor,
+    norm: Optional[str] = "ortho",
+    inverse: Optional[bool] = False,
+    csphase: Optional[bool] = True,
+    *,
+    mmin: Optional[int] = 0,
+    lmin: Optional[int] = 0,
+) -> torch.Tensor:
+    r"""
+    Computes the values of the derivatives $\frac{d}{d \theta} P^m_l(\cos \theta)$ as well as
+    $\frac{1}{\sin \theta} P^m_l(\cos \theta)$ (with the implicit $-jm$ factor stripped),
+    needed for the vector spherical harmonics. The resulting tensor has shape
+    (2, mmax - mmin, lmax - lmin, len(t)).
+
+    There is no inter-iteration dependence here -- each entry depends only on values from the
+    precomputed associated Legendre table -- so both ``m`` and ``l`` axes are vectorized at once.
+
+    Each output entry reads orders ``m-1`` and ``m+1`` at degrees ``l`` and ``l+1``, so a
+    restricted block needs the underlying table widened by one in each direction. That halo is
+    requested here rather than by the caller.
+
+    Parameters
+    ----------
+    mmax : int
+        Maximum order of the spherical harmonics (exclusive)
+    lmax : int
+        Maximum degree of the spherical harmonics (exclusive)
+    t : torch.Tensor
+        Tensor of positions at which to evaluate the Legendre polynomials
+    norm : Optional[str]
+        Normalization of the Legendre polynomials
+    inverse : Optional[bool]
+        Whether to compute the inverse Legendre polynomials
+    csphase : Optional[bool]
+        Whether to apply the Condon-Shortley phase (-1)^m
+    mmin : Optional[int]
+        First order to store, by default 0
+    lmin : Optional[int]
+        First degree to store, by default 0
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of derivative Legendre polynomial values
+
+    References
+    ----------
+    :cite:`Wang2018`
+    """
+
+    return _dlegpoly(
+        mmax,
+        lmax,
+        t,
+        norm=norm,
+        inverse=inverse,
+        csphase=csphase,
+        mmin=mmin,
+        lmin=lmin,
+        l_minus_m_max=None,
+    )
+
+
 @lru_cache(typed=True, copy=True)
 @torch.no_grad()
 def _precompute_dlegpoly(
@@ -511,7 +659,7 @@ def _precompute_dlegpoly(
     kmax : Optional[int]
         One past the last latitude to evaluate, by default ``nlat``
     l_minus_m_max : Optional[int]
-        Optional maximum value of ``l - m`` passed to :func:`dlegpoly`.
+        Optional maximum value of ``l - m`` passed to :func:`_dlegpoly`.
 
     Returns
     -------
@@ -522,7 +670,7 @@ def _precompute_dlegpoly(
     lats, _ = precompute_latitudes(nlat, grid=grid)
     kmax = nlat if kmax is None else kmax
 
-    return dlegpoly(
+    return _dlegpoly(
         mmax,
         lmax,
         lats[kmin:kmax],

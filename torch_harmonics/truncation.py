@@ -158,8 +158,9 @@ def truncate_sht(
     truncation : str, optional
         Truncation mode (``"triangular"``, ``"trapezoidal"`` or
         ``"rhomboidal"``), by default ``"triangular"``. Rhomboidal
-        truncation retains modes with ``l - m <= lmax - mmax``. For standard
-        atmospheric ``R42``, pass ``lmax=85``, ``mmax=43``.
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``. For standard atmospheric ``R42``, pass
+        ``lmax=85``, ``mmax=43``.
 
     Returns
     -------
@@ -185,8 +186,11 @@ def truncate_sht(
     (85, 43)
     """
 
-    lmax = lmax or _truncate_lmax(nlat, grid)
-    mmax = mmax or _truncate_mmax(nlon)
+    if truncation == "rhomboidal" and (lmax is None or mmax is None):
+        raise ValueError("Rhomboidal truncation requires explicit lmax and mmax")
+
+    lmax = _truncate_lmax(nlat, grid) if lmax is None else lmax
+    mmax = _truncate_mmax(nlon) if mmax is None else mmax
 
     if truncation == "triangular":
         lmax = min(lmax, mmax)
