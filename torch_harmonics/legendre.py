@@ -36,6 +36,7 @@ import torch
 
 from torch_harmonics.cache import lru_cache
 from torch_harmonics.quadrature import precompute_latitudes
+from torch_harmonics.truncation import _sht_support_mask, _sht_truncation_order_bounds
 
 
 def clm(l: int, m: int) -> float:
@@ -54,6 +55,7 @@ def legpoly(
     *,
     mmin: Optional[int] = 0,
     lmin: Optional[int] = 0,
+    max_degree_order_gap: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Computes the values of (-1)^m c^l_m P^l_m(x) at the positions specified by x.
@@ -95,6 +97,10 @@ def legpoly(
         First order to store, by default 0
     lmin : Optional[int]
         First degree to store, by default 0
+    max_degree_order_gap : Optional[int]
+        Optional maximum value of ``l - m`` to evaluate and store. This is a
+        mathematical support restriction used by rhomboidal SHT precomputation;
+        ``None`` retains the usual physical support ``m <= l``.
 
     Returns
     -------
@@ -131,14 +137,13 @@ def legpoly(
     prev1 = torch.zeros((nm, nk), dtype=torch.float64, device=x.device)
     prev2 = torch.zeros((nm, nk), dtype=torch.float64, device=x.device)
     cur = torch.zeros((nm, nk), dtype=torch.float64, device=x.device)
+    orders = torch.arange(mmin, mmax, dtype=torch.float64, device=x.device)
 
     # vdm[l, l], the sectoral seed. This is the one quantity that couples orders, so it is
     # carried for every order from 0 upward even when the stored block starts higher.
     diag = torch.empty((nk,), dtype=torch.float64, device=x.device)
 
     for l in range(lmax):
-        cur.zero_()
-
         if l == 0:
             diag_l = torch.full((nk,), norm_factor / math.sqrt(4 * math.pi), dtype=torch.float64, device=x.device)
         else:
@@ -146,28 +151,37 @@ def legpoly(
             sub_l = math.sqrt(2 * l + 1) * x * diag
             diag_l = torch.sqrt((2 * l + 1) * (1 + x) * (1 - x) / 2 / l) * diag
 
+        m_lo, m_hi = _sht_truncation_order_bounds(
+            l,
+            mmax,
+            mmin=mmin,
+            max_degree_order_gap=max_degree_order_gap,
+        )
+
         # three-term recurrence for the interior orders m <= l-2, vectorized across m
         if l >= 2:
-            m_hi = min(mmax - 1, l - 2)
-            if m_hi >= mmin:
-                m = torch.arange(mmin, m_hi + 1, dtype=torch.float64, device=x.device)
+            m_hi_interior = min(m_hi, l - 2)
+            if m_hi_interior >= m_lo:
+                m = orders[m_lo - mmin : m_hi_interior - mmin + 1]
                 a_lm = torch.sqrt((2 * l - 1) / (l - m) * (2 * l + 1) / (l + m))
                 b_lm = torch.sqrt((l + m - 1) / (l - m) * (2 * l + 1) / (2 * l - 3) * (l - m - 1) / (l + m))
-                nr = m_hi - mmin + 1
-                cur[:nr] = a_lm.unsqueeze(-1) * x.unsqueeze(0) * prev1[:nr] - b_lm.unsqueeze(-1) * prev2[:nr]
+                start = m_lo - mmin
+                stop = m_hi_interior - mmin + 1
+                cur[start:stop] = a_lm.unsqueeze(-1) * x.unsqueeze(0) * prev1[start:stop] - b_lm.unsqueeze(-1) * prev2[start:stop]
 
         # the two boundary orders, where they fall inside the stored range
-        if l >= 1 and mmin <= l - 1 < mmax:
+        if l >= 1 and m_lo <= l - 1 <= m_hi:
             cur[l - 1 - mmin] = sub_l
-        if mmin <= l < mmax:
+        if m_lo <= l <= m_hi:
             cur[l - mmin] = diag_l
 
-        if l >= lmin:
+        if l >= lmin and m_lo <= m_hi:
+            active = cur[m_lo - mmin : m_hi - mmin + 1]
             if norm == "schmidt":
                 factor = math.sqrt(2 * l + 1)
-                out[:, l - lmin] = cur * factor if inverse else cur / factor
+                out[m_lo - mmin : m_hi - mmin + 1, l - lmin] = active * factor if inverse else active / factor
             else:
-                out[:, l - lmin] = cur
+                out[m_lo - mmin : m_hi - mmin + 1, l - lmin] = active
 
         # roll the window: cur becomes l-1, prev1 becomes l-2, prev2's buffer is reused
         prev2, prev1, cur = prev1, cur, prev2
@@ -195,6 +209,7 @@ def _precompute_legpoly(
     lmin: Optional[int] = 0,
     kmin: Optional[int] = 0,
     kmax: Optional[int] = None,
+    max_degree_order_gap: Optional[int] = None,
 ) -> torch.Tensor:
     r"""
     Computes the values of (-1)^m c^l_m P^l_m(\cos \theta) on the colatitudes of a grid.
@@ -233,6 +248,8 @@ def _precompute_legpoly(
         One past the last latitude to evaluate, by default ``nlat``. Unlike the order and
         degree ranges, restricting latitudes costs nothing: they are independent of one
         another, so the excluded ones are never computed in the first place.
+    max_degree_order_gap : Optional[int]
+        Optional mathematical support restriction passed to :func:`legpoly`.
 
     Returns
     -------
@@ -243,7 +260,17 @@ def _precompute_legpoly(
     lats, _ = precompute_latitudes(nlat, grid=grid)
     kmax = nlat if kmax is None else kmax
 
-    return legpoly(mmax, lmax, torch.cos(lats[kmin:kmax]), norm=norm, inverse=inverse, csphase=csphase, mmin=mmin, lmin=lmin)
+    return legpoly(
+        mmax,
+        lmax,
+        torch.cos(lats[kmin:kmax]),
+        norm=norm,
+        inverse=inverse,
+        csphase=csphase,
+        mmin=mmin,
+        lmin=lmin,
+        max_degree_order_gap=max_degree_order_gap,
+    )
 
 
 @torch.no_grad()
@@ -257,6 +284,7 @@ def dlegpoly(
     *,
     mmin: Optional[int] = 0,
     lmin: Optional[int] = 0,
+    max_degree_order_gap: Optional[int] = None,
 ) -> torch.Tensor:
     r"""
     Computes the values of the derivatives $\frac{d}{d \theta} P^m_l(\cos \theta)$ as well as
@@ -289,6 +317,10 @@ def dlegpoly(
         First order to store, by default 0
     lmin : Optional[int]
         First degree to store, by default 0
+    max_degree_order_gap : Optional[int]
+        Optional maximum value of ``l - m`` to retain in the output. The
+        underlying Legendre table is built with a two-mode halo in this gap,
+        because the derivative formulas read ``(l + 1, m - 1)``.
 
     Returns
     -------
@@ -300,9 +332,21 @@ def dlegpoly(
     :cite:`Wang2018`
     """
 
-    # halo of one order below and above; the degree halo is the extra column at lmax
+    # halo of one order below and above; the degree halo is the extra column at lmax.
+    # The widest underlying degree-order gap is two larger than the requested
+    # output gap: (l + 1) - (m - 1).
     pmin = max(0, mmin - 1)
-    pct = legpoly(mmax + 1, lmax + 1, torch.cos(t), norm=norm, inverse=inverse, csphase=False, mmin=pmin, lmin=lmin)
+    pct = legpoly(
+        mmax + 1,
+        lmax + 1,
+        torch.cos(t),
+        norm=norm,
+        inverse=inverse,
+        csphase=False,
+        mmin=pmin,
+        lmin=lmin,
+        max_degree_order_gap=None if max_degree_order_gap is None else max_degree_order_gap + 2,
+    )
 
     nm = mmax - mmin
     nl = lmax - lmin
@@ -323,9 +367,18 @@ def dlegpoly(
     m_minus_1 = (m_idx - 1).clamp(min=0).long() - pmin  # (nm,)
     m_plus_1 = (m_idx + 1).long() - pmin  # (nm,); largest value mmax, the last row of pct
 
+    support = _sht_support_mask(
+        lmax,
+        mmax,
+        mmin=mmin,
+        lmin=lmin,
+        max_degree_order_gap=max_degree_order_gap,
+        device=t.device,
+    ).unsqueeze(-1)
+
     # mask of entries set by the interior+boundary recurrence: 1 <= m <= l.
     # the m=l boundary is naturally produced by the general formula (the (l-m) term vanishes).
-    mask = ((m_g >= 1) & (m_g <= l_g)).unsqueeze(-1)
+    mask = support & (m_g >= 1).unsqueeze(-1)
 
     # --- dpct[0]: d/dtheta P^m_l for 1 <= m <= l ---
     a0 = torch.sqrt(torch.clamp((l_g + m_g) * (l_g - m_g + 1), min=0.0))
@@ -337,7 +390,7 @@ def dlegpoly(
     # m=0 row: dpct[0, 0, l] = -sqrt(l(l+1)) * pct[1, l], only present if the block starts at m=0
     if mmin == 0:
         coef_m0 = -torch.sqrt(l_idx * (l_idx + 1))
-        dpct[0, 0, :] = coef_m0.unsqueeze(-1) * pct[1 - pmin, :nl]
+        dpct[0, 0, :] = support[0] * coef_m0.unsqueeze(-1) * pct[1 - pmin, :nl]
 
     # --- dpct[1]: -1j m P^m_l / sin(theta) (imag part stripped) for 1 <= m <= l ---
     c1 = torch.sqrt((2 * l_g + 1) / (2 * l_g + 3))
@@ -379,6 +432,7 @@ def _precompute_dlegpoly(
     lmin: Optional[int] = 0,
     kmin: Optional[int] = 0,
     kmax: Optional[int] = None,
+    max_degree_order_gap: Optional[int] = None,
 ) -> torch.Tensor:
     r"""
     Cached, grid-keyed counterpart of :func:`dlegpoly`, mirroring :func:`_precompute_legpoly`.
@@ -411,6 +465,8 @@ def _precompute_dlegpoly(
         First latitude to evaluate, by default 0
     kmax : Optional[int]
         One past the last latitude to evaluate, by default ``nlat``
+    max_degree_order_gap : Optional[int]
+        Optional mathematical support restriction passed to :func:`dlegpoly`.
 
     Returns
     -------
@@ -421,4 +477,14 @@ def _precompute_dlegpoly(
     lats, _ = precompute_latitudes(nlat, grid=grid)
     kmax = nlat if kmax is None else kmax
 
-    return dlegpoly(mmax, lmax, lats[kmin:kmax], norm=norm, inverse=inverse, csphase=csphase, mmin=mmin, lmin=lmin)
+    return dlegpoly(
+        mmax,
+        lmax,
+        lats[kmin:kmax],
+        norm=norm,
+        inverse=inverse,
+        csphase=csphase,
+        mmin=mmin,
+        lmin=lmin,
+        max_degree_order_gap=max_degree_order_gap,
+    )

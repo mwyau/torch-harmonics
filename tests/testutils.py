@@ -244,29 +244,33 @@ def split_tensor_hw(tensor, hdim=-2, wdim=-1, hsize=1, wsize=1, hrank=0, wrank=0
 
 def gather_tensor_hw(tensor, hdim=-2, wdim=-1, hshapes=[], wshapes=[], hsize=1, wsize=1, hrank=0, wrank=0, hgroup=None, wgroup=None):
     """Gather tensor along height/width according to process grid ranks and shapes."""
+
+    def gather_dim(tensor, dim, shapes, rank, group):
+        local_size = tensor.size(dim)
+        if local_size != shapes[rank]:
+            raise ValueError(f"Expected local size {shapes[rank]} along dim {dim}, got {local_size}")
+        max_size = max(shapes)
+        if local_size < max_size:
+            padded_shape = list(tensor.shape)
+            padded_shape[dim] = max_size
+            padded = torch.zeros(padded_shape, dtype=tensor.dtype, device=tensor.device)
+            local_slice = [slice(None)] * tensor.dim()
+            local_slice[dim] = slice(0, local_size)
+            padded[tuple(local_slice)] = tensor
+            tensor = padded
+        gather_shape = list(tensor.shape)
+        gather_shape[dim] = max_size
+        gathered = [torch.empty(gather_shape, dtype=tensor.dtype, device=tensor.device) for _ in shapes]
+        dist.all_gather(gathered, tensor, group=group)
+        return torch.cat([chunk.narrow(dim, 0, size) for chunk, size in zip(gathered, shapes)], dim=dim)
+
     with torch.no_grad():
         tensor = tensor.contiguous()
         if wsize > 1:
-            local_shape = list(tensor.shape)
-            gather_shapes = []
-            for w in wshapes:
-                local_shape[wdim] = w
-                gather_shapes.append(tuple(local_shape))
-            olist = [torch.empty(shape, dtype=tensor.dtype, device=tensor.device) for shape in gather_shapes]
-            olist[wrank] = tensor
-            dist.all_gather(olist, tensor, group=wgroup)
-            tensor = torch.cat(olist, dim=wdim)
+            tensor = gather_dim(tensor, wdim, wshapes, wrank, wgroup)
 
         if hsize > 1:
-            local_shape = list(tensor.shape)
-            gather_shapes = []
-            for h in hshapes:
-                local_shape[hdim] = h
-                gather_shapes.append(tuple(local_shape))
-            olist = [torch.empty(shape, dtype=tensor.dtype, device=tensor.device) for shape in gather_shapes]
-            olist[hrank] = tensor
-            dist.all_gather(olist, tensor, group=hgroup)
-            tensor = torch.cat(olist, dim=hdim)
+            tensor = gather_dim(tensor, hdim, hshapes, hrank, hgroup)
 
     return tensor
 
