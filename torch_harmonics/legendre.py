@@ -141,7 +141,7 @@ def legpoly(
     diag = torch.empty((nk,), dtype=torch.float64, device=x.device)
 
     if l_minus_m_max is None:
-        for l in range(lmax):
+        for l in range(min(lmax, mmax + 1)):
             cur.zero_()
 
             if l == 0:
@@ -177,6 +177,25 @@ def legpoly(
             # roll the window: cur becomes l-1, prev1 becomes l-2, prev2's buffer is reused
             prev2, prev1, cur = prev1, cur, prev2
             diag = diag_l
+
+        if lmax > mmax + 1:
+            orders = torch.arange(mmin, mmax, dtype=torch.float64, device=x.device)
+            # For l > mmax, every stored order satisfies m <= l - 2, so cur is fully overwritten.
+            for l in range(mmax + 1, lmax):
+                diag_l = torch.sqrt((2 * l + 1) * (1 + x) * (1 - x) / 2 / l) * diag
+                a_lm = torch.sqrt((2 * l - 1) / (l - orders) * (2 * l + 1) / (l + orders))
+                b_lm = torch.sqrt((l + orders - 1) / (l - orders) * (2 * l + 1) / (2 * l - 3) * (l - orders - 1) / (l + orders))
+                cur[:] = a_lm.unsqueeze(-1) * x.unsqueeze(0) * prev1 - b_lm.unsqueeze(-1) * prev2
+
+                if l >= lmin:
+                    if norm == "schmidt":
+                        factor = math.sqrt(2 * l + 1)
+                        out[:, l - lmin] = cur * factor if inverse else cur / factor
+                    else:
+                        out[:, l - lmin] = cur
+
+                prev2, prev1, cur = prev1, cur, prev2
+                diag = diag_l
     else:
         for l in range(lmax):
             if l == 0:
