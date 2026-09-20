@@ -35,7 +35,7 @@ import torch.nn as nn
 from torch_harmonics.fft import irfft, rfft
 from torch_harmonics.legendre import _precompute_dlegpoly, _precompute_legpoly
 from torch_harmonics.quadrature import precompute_latitudes
-from torch_harmonics.truncation import truncate_sht
+from torch_harmonics.truncation import _sht_l_minus_m_max, truncate_sht
 from torch_harmonics.utils import check
 
 
@@ -82,9 +82,11 @@ class RealSHT(nn.Module):
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -141,7 +143,16 @@ class RealSHT(nn.Module):
         weights = 2.0 * torch.pi * weights
 
         # combine quadrature weights with the legendre weights
-        pct = _precompute_legpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, csphase=self.csphase)
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
+        pct = _precompute_legpoly(
+            self.mmax,
+            self.lmax,
+            self.nlat,
+            self.grid,
+            norm=self.norm,
+            csphase=self.csphase,
+            l_minus_m_max=l_minus_m_max,
+        )
         weights = torch.einsum("mlk,k->mlk", pct, weights).contiguous()
 
         # remember quadrature weights
@@ -228,9 +239,11 @@ class InverseRealSHT(nn.Module):
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -289,7 +302,17 @@ class InverseRealSHT(nn.Module):
 
         # precompute associated Legendre polynomials
         # store as (mmax, nlat, lmax) so the contraction dim l is stride-1
-        pct = _precompute_legpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, inverse=True, csphase=self.csphase)
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
+        pct = _precompute_legpoly(
+            self.mmax,
+            self.lmax,
+            self.nlat,
+            self.grid,
+            norm=self.norm,
+            inverse=True,
+            csphase=self.csphase,
+            l_minus_m_max=l_minus_m_max,
+        )
         pct = pct.permute(0, 2, 1).contiguous()
 
         # register buffer
@@ -374,9 +397,11 @@ class RealVectorSHT(nn.Module):
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -426,7 +451,16 @@ class RealVectorSHT(nn.Module):
         self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
 
         # precompute associated Legendre polynomials
-        dpct = _precompute_dlegpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, csphase=self.csphase)
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
+        dpct = _precompute_dlegpoly(
+            self.mmax,
+            self.lmax,
+            self.nlat,
+            self.grid,
+            norm=self.norm,
+            csphase=self.csphase,
+            l_minus_m_max=l_minus_m_max,
+        )
 
         # fold the 2*pi longitudinal scale factor of the forward-normalized FFT into the
         # quadrature weights (see RealSHT.__init__)
@@ -535,9 +569,11 @@ class InverseRealVectorSHT(nn.Module):
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Examples
     --------
@@ -591,7 +627,17 @@ class InverseRealVectorSHT(nn.Module):
 
         # precompute associated Legendre polynomials
         # store as (2, mmax, nlat, lmax) so the contraction dim l is stride-1
-        dpct = _precompute_dlegpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, inverse=True, csphase=self.csphase)
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
+        dpct = _precompute_dlegpoly(
+            self.mmax,
+            self.lmax,
+            self.nlat,
+            self.grid,
+            norm=self.norm,
+            inverse=True,
+            csphase=self.csphase,
+            l_minus_m_max=l_minus_m_max,
+        )
         dpct = dpct.permute(0, 1, 3, 2).contiguous()
 
         # register weights

@@ -195,6 +195,7 @@ def _precompute_legpoly(
     lmin: Optional[int] = 0,
     kmin: Optional[int] = 0,
     kmax: Optional[int] = None,
+    l_minus_m_max: Optional[int] = None,
 ) -> torch.Tensor:
     r"""
     Computes the values of (-1)^m c^l_m P^l_m(\cos \theta) on the colatitudes of a grid.
@@ -233,6 +234,8 @@ def _precompute_legpoly(
         One past the last latitude to evaluate, by default ``nlat``. Unlike the order and
         degree ranges, restricting latitudes costs nothing: they are independent of one
         another, so the excluded ones are never computed in the first place.
+    l_minus_m_max : Optional[int]
+        Maximum global value of ``l - m`` to retain, or ``None`` for the dense table.
 
     Returns
     -------
@@ -243,7 +246,15 @@ def _precompute_legpoly(
     lats, _ = precompute_latitudes(nlat, grid=grid)
     kmax = nlat if kmax is None else kmax
 
-    return legpoly(mmax, lmax, torch.cos(lats[kmin:kmax]), norm=norm, inverse=inverse, csphase=csphase, mmin=mmin, lmin=lmin)
+    table = legpoly(mmax, lmax, torch.cos(lats[kmin:kmax]), norm=norm, inverse=inverse, csphase=csphase, mmin=mmin, lmin=lmin)
+    if l_minus_m_max is None:
+        return table
+
+    m = torch.arange(mmin, mmax, device=table.device).view(-1, 1)
+    l = torch.arange(lmin, lmax, device=table.device).view(1, -1)
+    support = (m <= l) & (l - m <= l_minus_m_max)
+    table.masked_fill_(~support.unsqueeze(-1), 0.0)
+    return table
 
 
 @torch.no_grad()
@@ -267,9 +278,8 @@ def dlegpoly(
     There is no inter-iteration dependence here -- each entry depends only on values from the
     precomputed associated Legendre table -- so both ``m`` and ``l`` axes are vectorized at once.
 
-    Each output entry reads orders ``m-1`` and ``m+1`` at degrees ``l`` and ``l+1``, so a
-    restricted block needs the underlying table widened by one in each direction. That halo is
-    requested here rather than by the caller.
+    Each output entry reads orders ``m-1`` and ``m+1`` at degrees ``l`` and ``l+1`` from the
+    ordinary dense Legendre table assembled internally.
 
     Parameters
     ----------
@@ -379,6 +389,7 @@ def _precompute_dlegpoly(
     lmin: Optional[int] = 0,
     kmin: Optional[int] = 0,
     kmax: Optional[int] = None,
+    l_minus_m_max: Optional[int] = None,
 ) -> torch.Tensor:
     r"""
     Cached, grid-keyed counterpart of :func:`dlegpoly`, mirroring :func:`_precompute_legpoly`.
@@ -411,6 +422,8 @@ def _precompute_dlegpoly(
         First latitude to evaluate, by default 0
     kmax : Optional[int]
         One past the last latitude to evaluate, by default ``nlat``
+    l_minus_m_max : Optional[int]
+        Maximum global value of ``l - m`` to retain, or ``None`` for the dense table.
 
     Returns
     -------
@@ -421,4 +434,12 @@ def _precompute_dlegpoly(
     lats, _ = precompute_latitudes(nlat, grid=grid)
     kmax = nlat if kmax is None else kmax
 
-    return dlegpoly(mmax, lmax, lats[kmin:kmax], norm=norm, inverse=inverse, csphase=csphase, mmin=mmin, lmin=lmin)
+    table = dlegpoly(mmax, lmax, lats[kmin:kmax], norm=norm, inverse=inverse, csphase=csphase, mmin=mmin, lmin=lmin)
+    if l_minus_m_max is None:
+        return table
+
+    m = torch.arange(mmin, mmax, device=table.device).view(1, -1, 1, 1)
+    l = torch.arange(lmin, lmax, device=table.device).view(1, 1, -1, 1)
+    support = (m <= l) & (l - m <= l_minus_m_max)
+    table.masked_fill_(~support, 0.0)
+    return table

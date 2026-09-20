@@ -35,7 +35,7 @@ import torch.nn as nn
 from torch_harmonics.fft import irfft, rfft
 from torch_harmonics.legendre import _precompute_dlegpoly, _precompute_legpoly
 from torch_harmonics.quadrature import precompute_latitudes
-from torch_harmonics.truncation import truncate_sht
+from torch_harmonics.truncation import _sht_l_minus_m_max, truncate_sht
 from torch_harmonics.utils import check
 
 from .primitives import (
@@ -108,9 +108,11 @@ class DistributedRealSHT(nn.Module):
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Returns
     -------
@@ -173,6 +175,7 @@ class DistributedRealSHT(nn.Module):
         weights = weights[self.lat_offset : self.lat_offset + self.nlat_local]
 
         # combine quadrature weights with the legendre weights
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         pct = _precompute_legpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax,
@@ -183,6 +186,7 @@ class DistributedRealSHT(nn.Module):
             mmin=self.mmax_offset,
             kmin=self.lat_offset,
             kmax=self.lat_offset + self.nlat_local,
+            l_minus_m_max=l_minus_m_max,
         )
         weights = torch.einsum("mlk,k->mlk", pct, weights).contiguous()
 
@@ -310,9 +314,11 @@ class DistributedInverseRealSHT(nn.Module):
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Returns
     -------
@@ -360,6 +366,7 @@ class DistributedInverseRealSHT(nn.Module):
         # seed couples orders and the three-term recurrence couples degrees, so each has to be
         # walked from the start even though only the local window is stored.
         # store as (mmax_local, nlat, lmax_local) so the contraction dim l is stride-1
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         pct = _precompute_legpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax_offset + self.lmax_local,
@@ -370,6 +377,7 @@ class DistributedInverseRealSHT(nn.Module):
             csphase=self.csphase,
             mmin=self.mmax_offset,
             lmin=self.lmax_offset,
+            l_minus_m_max=l_minus_m_max,
         )
         pct = pct.permute(0, 2, 1).contiguous()
 
@@ -472,9 +480,11 @@ class DistributedRealVectorSHT(nn.Module):
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Returns
     -------
@@ -526,6 +536,7 @@ class DistributedRealVectorSHT(nn.Module):
         weights = weights[self.lat_offset : self.lat_offset + self.nlat_local]
 
         # compute weights
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax,
@@ -536,6 +547,7 @@ class DistributedRealVectorSHT(nn.Module):
             mmin=self.mmax_offset,
             kmin=self.lat_offset,
             kmax=self.lat_offset + self.nlat_local,
+            l_minus_m_max=l_minus_m_max,
         )
 
         # fold the 2*pi longitudinal scale factor of the forward-normalized FFT into the
@@ -658,9 +670,11 @@ class DistributedInverseRealVectorSHT(nn.Module):
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
     truncation : str
-        Truncation mode (``"triangular"`` or ``"trapezoidal"``), by default
-        ``"triangular"``. Trapezoidal truncation keeps independent degree
-        and order limits.
+        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
+        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
+        truncation keeps independent degree and order limits. Rhomboidal
+        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
+        with ``l - m <= lmax - mmax``.
 
     Returns
     -------
@@ -705,6 +719,7 @@ class DistributedInverseRealVectorSHT(nn.Module):
         # build only the block this rank keeps: local orders, local degrees, all latitudes,
         # see DistributedInverseRealSHT.__init__
         # store as (2, mmax_local, nlat, lmax_local) so the contraction dim l is stride-1
+        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax_offset + self.lmax_local,
@@ -715,6 +730,7 @@ class DistributedInverseRealVectorSHT(nn.Module):
             csphase=self.csphase,
             mmin=self.mmax_offset,
             lmin=self.lmax_offset,
+            l_minus_m_max=l_minus_m_max,
         )
         dpct = dpct.permute(0, 1, 3, 2).contiguous()
 
