@@ -30,11 +30,33 @@
 #
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 
 class TestCacheConsistency(unittest.TestCase):
+    def test_truncation_cache(self):
+        """Equal descriptors share a cache entry; distinct bandwidths cannot collide."""
+        import torch_harmonics.legendre as legendre
+        from torch_harmonics.truncation import SHTTruncation
+
+        for precompute, core in ((legendre._precompute_legpoly, "legpoly"), (legendre._precompute_dlegpoly, "dlegpoly")):
+            with self.subTest(core=core), patch.object(legendre, core, wraps=getattr(legendre, core)) as build:
+                first = precompute(7, 13, 23, "legendre-gauss", trunc=SHTTruncation(13, 7, 5))
+                repeat = precompute(7, 13, 23, "legendre-gauss", trunc=SHTTruncation(13, 7, 5))
+                self.assertEqual(build.call_count, 1)
+                self.assertTrue(torch.equal(first, repeat))
+                first.zero_()
+                self.assertTrue(torch.equal(repeat, precompute(7, 13, 23, "legendre-gauss", trunc=SHTTruncation(13, 7, 5))))
+                narrower = precompute(7, 13, 23, "legendre-gauss", trunc=SHTTruncation(13, 7, 4))
+                dense = precompute(7, 13, 23, "legendre-gauss", trunc=SHTTruncation(13, 7, None))
+                self.assertEqual(build.call_count, 3)
+                self.assertTrue(dense[..., 1, 6, :].ne(0).any())
+                self.assertTrue(repeat[..., 1, 6, :].eq(0).all())
+                self.assertTrue(repeat[..., 1, 5, :].ne(0).any())
+                self.assertTrue(narrower[..., 1, 5, :].eq(0).all())
+
     def test_consistency(self, verbose=False):
         if verbose:
             print("Testing that cache values does not get modified externally")

@@ -174,7 +174,8 @@ def setup_distributed_context(ctx):
         print(f"Running distributed tests on grid H x W = {ctx.grid_size_h} x {ctx.grid_size_w}")
 
     thd.init(ctx.h_group, ctx.w_group)
-    torch.cuda.set_device(ctx.device.index)
+    if ctx.device.type == "cuda":
+        torch.cuda.set_device(ctx.device.index)
 
     return
 

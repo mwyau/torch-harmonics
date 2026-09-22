@@ -30,7 +30,16 @@
 #
 
 import warnings
-from typing import Optional, Tuple
+from numbers import Integral
+from typing import NamedTuple, Optional
+
+
+class SHTTruncation(NamedTuple):
+    """Global non-inclusive degree, order, and optional degree-minus-order limits."""
+
+    lmax: int
+    mmax: int
+    lmmax: Optional[int] = None
 
 
 def _truncate_lmax(nlat: int, grid: Optional[str] = "equiangular") -> int:
@@ -96,8 +105,8 @@ def truncate_sht(
     lmax: Optional[int] = None,
     mmax: Optional[int] = None,
     grid: Optional[str] = "equiangular",
-    truncation: str = "triangular",
-) -> Tuple[int, int]:
+    lmmax: Optional[int] = None,
+) -> SHTTruncation:
     r"""
     Determine the maximum spherical harmonic degree and order for an SHT based
     on the spatial grid.
@@ -131,12 +140,17 @@ def truncate_sht(
     The default longitudinal truncation is the Nyquist limit of the uniform
     longitude grid: :math:`m_{\max} = \lfloor N_\lambda / 2 \rfloor + 1`.
 
-    The default **triangular truncation** uses the same non-inclusive limit for
-    degree and order, so every retained degree has a full set of orders.
-    **Trapezoidal truncation** retains independent non-inclusive degree and
-    order limits, with ``mmax`` capped at ``lmax``. **Rhomboidal truncation**
-    uses the same dense bounding limits while retaining only modes satisfying
-    ``m <= l`` and ``l - m <= lmax - mmax``.
+    Degree and order limits are independent. Orders are capped at ``lmax`` because
+    physical modes satisfy ``m <= l``. An explicit ``mmax > lmax`` is an error
+    when ``lmmax`` is provided; bandwidth-constrained limits are not reshaped.
+    Omitted ``mmax`` defaults to the smaller of the Nyquist limit and ``lmax``.
+
+    Modes satisfy ``m < mmax`` and ``m <= l < lmax``, and additionally
+    ``l - m < lmmax`` when the bandwidth is provided. These limits describe
+    generalized pentagonal truncation: equal ``lmax`` and ``mmax`` without a
+    bandwidth cap give triangular bounds; ``lmmax=None`` gives trapezoidal
+    bounds; ``lmmax == mmax`` with ``lmax == mmax + lmmax - 1`` gives a standard
+    rhomboid. A smaller independent ``lmax`` caps that rhomboid.
 
     Parameters
     ----------
@@ -150,64 +164,52 @@ def truncate_sht(
         grid as shown in the table above.
     mmax : int, optional
         User-defined maximum azimuthal harmonic order (non-inclusive).
-        If not provided, set to the Nyquist limit
+        If not provided, set to the smaller of ``lmax`` and the Nyquist limit
         :math:`\lfloor N_\lambda / 2 \rfloor + 1`.
     grid : str, optional
         Grid type (``"legendre-gauss"``, ``"lobatto"``, ``"equiangular"``,
         ``"equiangular-trapezoidal"``), by default ``"equiangular"``.
-    truncation : str, optional
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``. For standard atmospheric ``R42``, pass
-        ``lmax=85``, ``mmax=43``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Returns
     -------
-    lmax : int
-        Maximum spherical harmonic degree (non-inclusive).
-    mmax : int
-        Maximum azimuthal harmonic order (non-inclusive).
+    SHTTruncation
+        Immutable ``(lmax, mmax, lmmax)`` limits, all non-inclusive.
 
     Examples
     --------
     >>> from torch_harmonics import truncate_sht
     >>> truncate_sht(128, 256, grid="legendre-gauss")
-    (128, 128)
+    SHTTruncation(lmax=128, mmax=128, lmmax=None)
     >>> truncate_sht(128, 256, grid="lobatto")
-    (127, 127)
+    SHTTruncation(lmax=127, mmax=127, lmmax=None)
     >>> truncate_sht(128, 256, grid="equiangular")
-    (64, 64)
+    SHTTruncation(lmax=64, mmax=64, lmmax=None)
     >>> truncate_sht(128, 256, lmax=96, mmax=48, grid="legendre-gauss")
-    (48, 48)
-    >>> truncate_sht(128, 256, lmax=96, mmax=48, grid="legendre-gauss", truncation="trapezoidal")
-    (96, 48)
-    >>> truncate_sht(128, 256, lmax=85, mmax=43, grid="legendre-gauss", truncation="rhomboidal")
-    (85, 43)
+    SHTTruncation(lmax=96, mmax=48, lmmax=None)
+    >>> # Standard R42 retains l - m == 42 and excludes l - m == 43.
+    >>> truncate_sht(128, 256, lmax=85, mmax=43, grid="legendre-gauss", lmmax=43)
+    SHTTruncation(lmax=85, mmax=43, lmmax=43)
+    >>> # The same bandwidth and order limit, with an independent degree cap.
+    >>> truncate_sht(128, 256, lmax=64, mmax=43, grid="legendre-gauss", lmmax=43)
+    SHTTruncation(lmax=64, mmax=43, lmmax=43)
     """
 
-    if truncation == "rhomboidal" and (lmax is None or mmax is None):
-        raise ValueError("Rhomboidal truncation requires explicit lmax and mmax")
-
+    explicit_mmax = mmax is not None
     lmax = _truncate_lmax(nlat, grid) if lmax is None else lmax
     mmax = _truncate_mmax(nlon) if mmax is None else mmax
 
-    if truncation == "triangular":
-        lmax = min(lmax, mmax)
-        mmax = lmax
-    elif truncation in ("trapezoidal", "rhomboidal"):
-        mmax = min(mmax, lmax)
-    else:
-        raise ValueError(f"Unknown truncation mode {truncation!r}; supported modes are 'triangular', 'trapezoidal', and 'rhomboidal'")
+    for name, limit in (("lmax", lmax), ("mmax", mmax), ("lmmax", lmmax)):
+        if name == "lmmax" and limit is None:
+            continue
+        if isinstance(limit, bool) or not isinstance(limit, Integral) or limit <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {limit!r}")
 
-    return lmax, mmax
+    if lmmax is not None and explicit_mmax and mmax > lmax:
+        raise ValueError("mmax must not exceed lmax when lmmax is provided")
+    mmax = min(mmax, lmax)
 
-
-def _sht_l_minus_m_max(lmax: int, mmax: int, truncation: str) -> Optional[int]:
-    """Return the optional rhomboidal ``l - m`` limit."""
-
-    if truncation in ("triangular", "trapezoidal"):
-        return None
-    if truncation == "rhomboidal":
-        return lmax - mmax
-    raise ValueError(f"Unknown truncation mode {truncation!r}; supported modes are 'triangular', 'trapezoidal', and 'rhomboidal'")
+    return SHTTruncation(lmax, mmax, lmmax)

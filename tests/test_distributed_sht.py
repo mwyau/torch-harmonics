@@ -179,15 +179,18 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             [33, 64, 65, 1, 10, "equiangular", True, 1e-5, 1e-6],
             [33, 64, 64, 1, 10, "legendre-gauss", True, 1e-5, 1e-6],
             # trapezoidal truncation
-            [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "trapezoidal"],
-            [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "trapezoidal"],
-            # N=8, M=7; both dense dimensions split evenly
-            [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
-            [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "rhomboidal"],
+            [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8],
+            [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8],
+            # l - m < 9; both dense dimensions split evenly
+            [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, 9],
+            [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, 9],
+            # Capped R7: the bandwidth limits low orders, lmax limits high orders.
+            [32, 64, 12, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, 8],
+            [32, 64, 12, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, 8],
         ],
         skip_on_empty=True,
     )
-    def test_distributed_sht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, truncation="triangular", verbose=False):
+    def test_distributed_sht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, lmmax=None, verbose=False):
 
         set_seed(333)
 
@@ -196,11 +199,11 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
 
         # set up handles
         if vector:
-            forward_transform_local = th.RealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            forward_transform_dist = thd.DistributedRealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
+            forward_transform_local = th.RealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            forward_transform_dist = thd.DistributedRealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
         else:
-            forward_transform_local = th.RealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            forward_transform_dist = thd.DistributedRealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
+            forward_transform_local = th.RealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            forward_transform_dist = thd.DistributedRealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
 
         # create tensors
         if vector:
@@ -320,16 +323,20 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             [33, 64, 9, 1, 10, "equiangular", True, 1e-5, 1e-6],
             [33, 64, 8, 1, 10, "legendre-gauss", True, 1e-5, 1e-6],
             # trapezoidal truncation
-            [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "trapezoidal"],
-            [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8, "trapezoidal"],
-            # N=8, M=7; both dense dimensions split evenly
-            [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, "rhomboidal"],
+            [32, 64, 24, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8],
+            [32, 64, 24, 32, 8, "legendre-gauss", True, 1e-5, 1e-6, 8],
+            # l - m < 9; both dense dimensions split evenly
+            [32, 64, 16, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, 9],
             # Two-rank polar reduction changes the high-degree vector inverse gradient by O(1e-5).
-            [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-4, 1e-6, 8, "rhomboidal"],
+            [32, 64, 16, 32, 8, "legendre-gauss", True, 1e-4, 1e-6, 8, 9],
+            # Capped R7, with both dense dimensions divisible by the process grid.
+            [32, 64, 12, 32, 8, "legendre-gauss", False, 1e-5, 1e-6, 8, 8],
+            # Same vector inverse reduction allowance as above (measured gradient error 7.7e-5).
+            [32, 64, 12, 32, 8, "legendre-gauss", True, 1e-4, 1e-6, 8, 8],
         ],
         skip_on_empty=True,
     )
-    def test_distributed_isht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, truncation="triangular", verbose=True):
+    def test_distributed_isht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, lmmax=None, verbose=True):
 
         set_seed(333)
 
@@ -337,13 +344,13 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         mmax = lmax if mmax is None else mmax
 
         if vector:
-            forward_transform_local = th.RealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            backward_transform_local = th.InverseRealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            backward_transform_dist = thd.DistributedInverseRealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
+            forward_transform_local = th.RealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            backward_transform_local = th.InverseRealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            backward_transform_dist = thd.DistributedInverseRealVectorSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
         else:
-            forward_transform_local = th.RealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            backward_transform_local = th.InverseRealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            backward_transform_dist = thd.DistributedInverseRealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
+            forward_transform_local = th.RealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            backward_transform_local = th.InverseRealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            backward_transform_dist = thd.DistributedInverseRealSHT(nlat=H, nlon=W, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
 
         # create tensors
         if vector:
@@ -401,7 +408,7 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # nlat, nlon, lmax, grid, vector, mmax, truncation
+            # nlat, nlon, lmax, grid, vector, mmax, lmmax
             [32, 64, None, "equiangular", False],
             [32, 64, None, "legendre-gauss", False],
             [33, 64, None, "equiangular", False],
@@ -409,12 +416,14 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
             [32, 64, None, "equiangular", True],
             [33, 64, None, "legendre-gauss", True],
             [32, 64, 8, "equiangular", True],
-            [32, 64, 16, "legendre-gauss", False, 8, "rhomboidal"],
-            [32, 64, 16, "legendre-gauss", True, 8, "rhomboidal"],
+            [32, 64, 16, "legendre-gauss", False, 8, 9],
+            [32, 64, 16, "legendre-gauss", True, 8, 9],
+            [32, 64, 12, "legendre-gauss", False, 8, 8],
+            [32, 64, 12, "legendre-gauss", True, 8, 8],
         ],
         skip_on_empty=True,
     )
-    def test_legendre_blocks(self, nlat, nlon, lmax, grid, vector, mmax=None, truncation="triangular", verbose=False):
+    def test_legendre_blocks(self, nlat, nlon, lmax, grid, vector, mmax=None, lmmax=None, verbose=False):
         """Each rank's precomputed Legendre buffer equals its slice of the serial one.
 
         The distributed transforms build only the block they keep rather than the whole
@@ -424,8 +433,8 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         that from the transform itself, so an off-by-one in the offsets shows up here rather
         than as a diffuse accuracy failure in the round trip.
 
-        For rhomboidal truncation, it also checks that the support mask uses those global
-        order and degree offsets.
+        With an explicit lmmax, it also checks that the support mask uses those global
+        order and degree offsets for l - m < lmmax.
 
         Each rank checks only its own block against the corresponding cut-out of the serial
         construction, so there is no collective involved and a failure identifies the rank.
@@ -439,17 +448,23 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
 
         mmax = lmax if mmax is None else mmax
         if vector:
-            fwd_dist = thd.DistributedRealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            fwd_local = th.RealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            inv_dist = thd.DistributedInverseRealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            inv_local = th.InverseRealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
+            fwd_dist = thd.DistributedRealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            fwd_local = th.RealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            inv_dist = thd.DistributedInverseRealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            inv_local = th.InverseRealVectorSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
             fwd_buf, inv_buf = "weights", "dpct"
         else:
-            fwd_dist = thd.DistributedRealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            fwd_local = th.RealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            inv_dist = thd.DistributedInverseRealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
-            inv_local = th.InverseRealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, truncation=truncation).to(self.device)
+            fwd_dist = thd.DistributedRealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            fwd_local = th.RealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            inv_dist = thd.DistributedInverseRealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
+            inv_local = th.InverseRealSHT(nlat=nlat, nlon=nlon, lmax=lmax, mmax=mmax, grid=grid, lmmax=lmmax).to(self.device)
             fwd_buf, inv_buf = "weights", "pct"
+
+        for transform in (fwd_dist, fwd_local, inv_dist, inv_local):
+            self.assertEqual((transform.lmax, transform.mmax, transform.lmmax), transform._trunc)
+            self.assertEqual(transform.lmmax, lmmax)
+            for name in ("lmax", "mmax", "lmmax"):
+                self.assertNotIn(name, vars(transform))
 
         # offsets are recomputed here from the per-rank shape lists rather than read off the
         # transform, so a wrong offset in the construction is not masked by reusing it

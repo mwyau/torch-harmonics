@@ -35,7 +35,7 @@ import torch.nn as nn
 from torch_harmonics.fft import irfft, rfft
 from torch_harmonics.legendre import _precompute_dlegpoly, _precompute_legpoly
 from torch_harmonics.quadrature import precompute_latitudes
-from torch_harmonics.truncation import _sht_l_minus_m_max, truncate_sht
+from torch_harmonics.truncation import truncate_sht
 from torch_harmonics.utils import check
 
 from .primitives import (
@@ -107,12 +107,10 @@ class DistributedRealSHT(nn.Module):
         Normalization type (``"ortho"``, ``"schmidt"``, ``"unnorm"``), by default ``"ortho"``
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Returns
     -------
@@ -124,7 +122,7 @@ class DistributedRealSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -133,7 +131,6 @@ class DistributedRealSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         # TODO: include assertions regarding the dimensions
 
@@ -148,7 +145,7 @@ class DistributedRealSHT(nn.Module):
         self.comm_rank_azimuth = azimuth_group_rank()
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # compute splits
         self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
@@ -175,7 +172,6 @@ class DistributedRealSHT(nn.Module):
         weights = weights[self.lat_offset : self.lat_offset + self.nlat_local]
 
         # combine quadrature weights with the legendre weights
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         pct = _precompute_legpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax,
@@ -186,15 +182,27 @@ class DistributedRealSHT(nn.Module):
             mmin=self.mmax_offset,
             kmin=self.lat_offset,
             kmax=self.lat_offset + self.nlat_local,
-            l_minus_m_max=l_minus_m_max,
+            trunc=self._trunc,
         )
         weights = torch.einsum("mlk,k->mlk", pct, weights).contiguous()
 
         # remember quadrature weights
         self.register_buffer("weights", weights, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     # This transform cannot be captured in a single graph: the redistribution collectives it
     # calls are themselves torch.compiler.disable()d, so at comm_size > 1 dynamo breaks at
@@ -313,12 +321,10 @@ class DistributedInverseRealSHT(nn.Module):
         Normalization type (``"ortho"``, ``"schmidt"``, ``"unnorm"``), by default ``"ortho"``
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Returns
     -------
@@ -330,7 +336,7 @@ class DistributedInverseRealSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -339,7 +345,6 @@ class DistributedInverseRealSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         # get the comms grid:
         self.comm_size_polar = polar_group_size()
@@ -348,7 +353,7 @@ class DistributedInverseRealSHT(nn.Module):
         self.comm_rank_azimuth = azimuth_group_rank()
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # compute splits
         self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
@@ -366,7 +371,6 @@ class DistributedInverseRealSHT(nn.Module):
         # seed couples orders and the three-term recurrence couples degrees, so each has to be
         # walked from the start even though only the local window is stored.
         # store as (mmax_local, nlat, lmax_local) so the contraction dim l is stride-1
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         pct = _precompute_legpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax_offset + self.lmax_local,
@@ -377,15 +381,27 @@ class DistributedInverseRealSHT(nn.Module):
             csphase=self.csphase,
             mmin=self.mmax_offset,
             lmin=self.lmax_offset,
-            l_minus_m_max=l_minus_m_max,
+            trunc=self._trunc,
         )
         pct = pct.permute(0, 2, 1).contiguous()
 
         # register
         self.register_buffer("pct", pct, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     # This transform cannot be captured in a single graph: the redistribution collectives it
     # calls are themselves torch.compiler.disable()d, so at comm_size > 1 dynamo breaks at
@@ -479,12 +495,10 @@ class DistributedRealVectorSHT(nn.Module):
         Normalization type (``"ortho"``, ``"schmidt"``, ``"unnorm"``), by default ``"ortho"``
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Returns
     -------
@@ -496,7 +510,7 @@ class DistributedRealVectorSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -505,7 +519,6 @@ class DistributedRealVectorSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         # quadrature weights; the grid switch and the cosine transform live in
         # precompute_latitudes, which is cached on (nlat, grid)
@@ -518,7 +531,7 @@ class DistributedRealVectorSHT(nn.Module):
         self.comm_rank_azimuth = azimuth_group_rank()
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # compute splits
         self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
@@ -536,7 +549,6 @@ class DistributedRealVectorSHT(nn.Module):
         weights = weights[self.lat_offset : self.lat_offset + self.nlat_local]
 
         # compute weights
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax,
@@ -547,7 +559,7 @@ class DistributedRealVectorSHT(nn.Module):
             mmin=self.mmax_offset,
             kmin=self.lat_offset,
             kmax=self.lat_offset + self.nlat_local,
-            l_minus_m_max=l_minus_m_max,
+            trunc=self._trunc,
         )
 
         # fold the 2*pi longitudinal scale factor of the forward-normalized FFT into the
@@ -565,8 +577,20 @@ class DistributedRealVectorSHT(nn.Module):
         # remember quadrature weights
         self.register_buffer("weights", weights, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     # This transform cannot be captured in a single graph: the redistribution collectives it
     # calls are themselves torch.compiler.disable()d, so at comm_size > 1 dynamo breaks at
@@ -669,12 +693,10 @@ class DistributedInverseRealVectorSHT(nn.Module):
         Normalization type (``"ortho"``, ``"schmidt"``, ``"unnorm"``), by default ``"ortho"``
     csphase : bool
         Whether to apply the Condon-Shortley phase factor, by default True
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Returns
     -------
@@ -686,7 +708,7 @@ class DistributedInverseRealVectorSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -695,7 +717,6 @@ class DistributedInverseRealVectorSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         self.comm_size_polar = polar_group_size()
         self.comm_rank_polar = polar_group_rank()
@@ -703,7 +724,7 @@ class DistributedInverseRealVectorSHT(nn.Module):
         self.comm_rank_azimuth = azimuth_group_rank()
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # compute splits
         self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
@@ -719,7 +740,6 @@ class DistributedInverseRealVectorSHT(nn.Module):
         # build only the block this rank keeps: local orders, local degrees, all latitudes,
         # see DistributedInverseRealSHT.__init__
         # store as (2, mmax_local, nlat, lmax_local) so the contraction dim l is stride-1
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax_offset + self.mmax_local,
             self.lmax_offset + self.lmax_local,
@@ -730,15 +750,27 @@ class DistributedInverseRealVectorSHT(nn.Module):
             csphase=self.csphase,
             mmin=self.mmax_offset,
             lmin=self.lmax_offset,
-            l_minus_m_max=l_minus_m_max,
+            trunc=self._trunc,
         )
         dpct = dpct.permute(0, 1, 3, 2).contiguous()
 
         # register buffer
         self.register_buffer("dpct", dpct, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     # This transform cannot be captured in a single graph: the redistribution collectives it
     # calls are themselves torch.compiler.disable()d, so at comm_size > 1 dynamo breaks at

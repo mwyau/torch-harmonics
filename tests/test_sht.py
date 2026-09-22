@@ -280,19 +280,19 @@ class TestLegendrePolynomials(unittest.TestCase):
                 ok = compare_tensors(case, block, ref.contiguous(), atol=0.0, rtol=0.0, verbose=verbose)
                 self.assertTrue(ok, msg=f"values differ from the full-table slice: {case}")
 
-    def test_rhomboidal_precompute_mask(self, verbose=False):
-        """Cached dense tables retain only the requested global rhomboidal support."""
+    def test_bandwidth_precompute_mask(self, verbose=False):
+        """Cached dense tables retain only the requested global degree-minus-order bandwidth."""
 
         nlat = 18
         mmax, lmax = 8, 12
         mmin, lmin = 2, 3
         kmin, kmax = 1, nlat - 1
-        N = 4
+        lmmax = 5
         t, _ = precompute_latitudes(nlat, grid="legendre-gauss")
 
         m = torch.arange(mmin, mmax).view(-1, 1)
         l = torch.arange(lmin, lmax).view(1, -1)
-        support = (m <= l) & (l - m <= N)
+        support = (m <= l) & (l - m < lmmax)
 
         cases = (
             (th.legendre._precompute_legpoly, th.legendre.legpoly, torch.cos(t[kmin:kmax])),
@@ -312,7 +312,7 @@ class TestLegendrePolynomials(unittest.TestCase):
                 lmin=lmin,
                 kmin=kmin,
                 kmax=kmax,
-                l_minus_m_max=N,
+                trunc=th.truncate_sht(nlat, 32, lmax=lmax, mmax=mmax, grid="legendre-gauss", lmmax=lmmax),
             )
             table_support = support.unsqueeze(-1)
             if masked.ndim == 4:
@@ -320,7 +320,7 @@ class TestLegendrePolynomials(unittest.TestCase):
             table_support = table_support.expand_as(masked)
             retained, expected = masked[table_support], dense[table_support]
             outside = masked[~table_support]
-            case = f"{precompute.__name__} mmin={mmin} lmin={lmin} N={N}"
+            case = f"{precompute.__name__} mmin={mmin} lmin={lmin} lmmax={lmmax}"
             self.assertTrue(compare_tensors(case, expected, retained, atol=0.0, rtol=0.0, verbose=verbose))
             self.assertTrue(torch.equal(outside, torch.zeros_like(outside)), f"nonzero outside support: {case}")
 

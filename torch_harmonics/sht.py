@@ -35,7 +35,7 @@ import torch.nn as nn
 from torch_harmonics.fft import irfft, rfft
 from torch_harmonics.legendre import _precompute_dlegpoly, _precompute_legpoly
 from torch_harmonics.quadrature import precompute_latitudes
-from torch_harmonics.truncation import _sht_l_minus_m_max, truncate_sht
+from torch_harmonics.truncation import truncate_sht
 from torch_harmonics.utils import check
 
 
@@ -81,12 +81,10 @@ class RealSHT(nn.Module):
     csphase : bool
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Examples
     --------
@@ -117,7 +115,7 @@ class RealSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -126,7 +124,6 @@ class RealSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         # TODO: include assertions regarding the dimensions
 
@@ -135,7 +132,7 @@ class RealSHT(nn.Module):
         _, weights = precompute_latitudes(nlat, grid=self.grid)
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # fold the 2*pi longitudinal scale factor of the forward-normalized FFT into the
         # quadrature weights. It is a constant prefactor of a linear transform, so folding it
@@ -143,15 +140,26 @@ class RealSHT(nn.Module):
         weights = 2.0 * torch.pi * weights
 
         # combine quadrature weights with the legendre weights
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
-        pct = _precompute_legpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, csphase=self.csphase, l_minus_m_max=l_minus_m_max)
+        pct = _precompute_legpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, csphase=self.csphase, trunc=self._trunc)
         weights = torch.einsum("mlk,k->mlk", pct, weights).contiguous()
 
         # remember quadrature weights
         self.register_buffer("weights", weights, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     def forward(self, x: torch.Tensor):
         """
@@ -230,12 +238,10 @@ class InverseRealSHT(nn.Module):
     csphase : bool
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Examples
     --------
@@ -278,7 +284,7 @@ class InverseRealSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -287,22 +293,32 @@ class InverseRealSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # precompute associated Legendre polynomials
         # store as (mmax, nlat, lmax) so the contraction dim l is stride-1
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
-        pct = _precompute_legpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, inverse=True, csphase=self.csphase, l_minus_m_max=l_minus_m_max)
+        pct = _precompute_legpoly(self.mmax, self.lmax, self.nlat, self.grid, norm=self.norm, inverse=True, csphase=self.csphase, trunc=self._trunc)
         pct = pct.permute(0, 2, 1).contiguous()
 
         # register buffer
         self.register_buffer("pct", pct, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     def forward(self, x: torch.Tensor):
         """
@@ -379,12 +395,10 @@ class RealVectorSHT(nn.Module):
     csphase : bool
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Examples
     --------
@@ -415,7 +429,7 @@ class RealVectorSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -424,17 +438,15 @@ class RealVectorSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         # nodes and quadrature weights; the grid switch and the cosine transform live in
         # precompute_latitudes, which is cached on (nlat, grid)
         _, weights = precompute_latitudes(nlat, grid=self.grid)
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # precompute associated Legendre polynomials
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax,
             self.lmax,
@@ -442,7 +454,7 @@ class RealVectorSHT(nn.Module):
             self.grid,
             norm=self.norm,
             csphase=self.csphase,
-            l_minus_m_max=l_minus_m_max,
+            trunc=self._trunc,
         )
 
         # fold the 2*pi longitudinal scale factor of the forward-normalized FFT into the
@@ -460,8 +472,20 @@ class RealVectorSHT(nn.Module):
         # remember quadrature weights
         self.register_buffer("weights", weights, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     def forward(self, x: torch.Tensor):
         """
@@ -551,12 +575,10 @@ class InverseRealVectorSHT(nn.Module):
     csphase : bool
         Whether to include the Condon--Shortley phase factor :math:`(-1)^m`,
         by default ``True``.
-    truncation : str
-        Truncation mode (``"triangular"``, ``"trapezoidal"`` or
-        ``"rhomboidal"``), by default ``"triangular"``. Trapezoidal
-        truncation keeps independent degree and order limits. Rhomboidal
-        truncation requires explicit ``lmax`` and ``mmax`` and retains modes
-        with ``l - m <= lmax - mmax``.
+    lmmax : int, optional
+        Maximum non-inclusive degree-minus-order bandwidth. Modes satisfy
+        ``l - m < lmmax`` when provided. If ``None``, no additional
+        degree-minus-order restriction is applied.
 
     Examples
     --------
@@ -594,7 +616,7 @@ class InverseRealVectorSHT(nn.Module):
     :cite:`Schaeffer2013`, :cite:`Wang2018`
     """
 
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, truncation="triangular"):
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="equiangular", norm="ortho", csphase=True, lmmax=None):
 
         super().__init__()
 
@@ -603,14 +625,12 @@ class InverseRealVectorSHT(nn.Module):
         self.grid = grid
         self.norm = norm
         self.csphase = csphase
-        self.truncation = truncation
 
         # determine spectral truncation
-        self.lmax, self.mmax = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, truncation=self.truncation)
+        self._trunc = truncate_sht(self.nlat, self.nlon, lmax, mmax, self.grid, lmmax=lmmax)
 
         # precompute associated Legendre polynomials
         # store as (2, mmax, nlat, lmax) so the contraction dim l is stride-1
-        l_minus_m_max = _sht_l_minus_m_max(self.lmax, self.mmax, self.truncation)
         dpct = _precompute_dlegpoly(
             self.mmax,
             self.lmax,
@@ -619,15 +639,27 @@ class InverseRealVectorSHT(nn.Module):
             norm=self.norm,
             inverse=True,
             csphase=self.csphase,
-            l_minus_m_max=l_minus_m_max,
+            trunc=self._trunc,
         )
         dpct = dpct.permute(0, 1, 3, 2).contiguous()
 
         # register weights
         self.register_buffer("dpct", dpct, persistent=False)
 
+    @property
+    def lmax(self):
+        return self._trunc.lmax
+
+    @property
+    def mmax(self):
+        return self._trunc.mmax
+
+    @property
+    def lmmax(self):
+        return self._trunc.lmmax
+
     def extra_repr(self):
-        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}, truncation={self.truncation}"
+        return f"nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax}, lmmax={self.lmmax},\n grid={self.grid}, csphase={self.csphase}"
 
     def forward(self, x: torch.Tensor):
         """
