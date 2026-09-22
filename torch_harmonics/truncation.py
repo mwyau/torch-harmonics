@@ -99,14 +99,7 @@ def _truncate_mmax(nlon: int) -> int:
     return nlon // 2 + 1
 
 
-def truncate_sht(
-    nlat: int,
-    nlon: int,
-    lmax: Optional[int] = None,
-    mmax: Optional[int] = None,
-    grid: Optional[str] = "equiangular",
-    lmmax: Optional[int] = None,
-) -> SHTTruncation:
+def truncate_sht(nlat: int, nlon: int, lmax: Optional[int] = None, mmax: Optional[int] = None, grid: Optional[str] = "equiangular", lmmax: Optional[int] = None) -> SHTTruncation:
     r"""
     Determine the maximum spherical harmonic degree and order for an SHT based
     on the spatial grid.
