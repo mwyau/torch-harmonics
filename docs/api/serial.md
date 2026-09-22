@@ -25,8 +25,9 @@ capped = RealSHT(128, 256, lmax=64, mmax=43, lmmax=43, grid="legendre-gauss")
 
 Omitted limits use the latitude grid's default degree limit and the longitude
 Nyquist limit, with `mmax` capped at `lmax`. Explicit `mmax > lmax` raises
-`ValueError` when `lmmax` is provided. `truncate_sht` returns the immutable
-`SHTTruncation(lmax, mmax, lmmax)` descriptor used by each transform.
+`ValueError` when `lmmax` is provided. `truncate_sht` returns an immutable
+truncation descriptor carrying `lmax`, `mmax`, and `lmmax`, used by each
+transform.
 
 ```{eval-rst}
 .. currentmodule:: torch_harmonics
