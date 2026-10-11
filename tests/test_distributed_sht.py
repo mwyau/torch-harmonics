@@ -72,7 +72,7 @@ def _report_margin(name, ref, got, atol, rtol):
     diff = (got - ref).abs().max().item()
     scale = ref.abs().max().item()
     eps = torch.finfo(ref.real.dtype if ref.is_complex() else ref.dtype).eps
-    print(f"{name}: max|diff| = {diff:.3e}, max|ref| = {scale:.3e}, " f"= {diff / max(eps * scale, 1e-30):.1f} eps*max|ref| (atol {atol:.0e}, rtol {rtol:.0e})")
+    print(f"{name}: max|diff| = {diff:.3e}, max|ref| = {scale:.3e}, {diff / max(eps * scale, 1e-30):.1f} eps*max|ref| (atol {atol:.0e}, rtol {rtol:.0e})")
 
 
 def _range_atol(ref, atol, ulps=8):
@@ -133,6 +133,120 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         )
 
         return tensor_gather
+
+    @parameterized.expand(
+        [
+            (geometry, vector, dtype, lmax, mmax, lmmax)
+            for geometry, cases in [
+                ("equiangular", [(16, 16, None), (15, 7, None), (15, 9, None), (15, 7, 8), (15, 15, 5), (16, 1, None), (16, 0, None)]),
+                ("fejer1", [(17, 17, None), (17, 17, 5), (16, 9, None)]),
+            ]
+            for vector in (False, True)
+            for dtype in (torch.float32, torch.float64)
+            for lmax, mmax, lmmax in cases
+        ],
+        skip_on_empty=True,
+    )
+    def test_extended_folded(self, geometry, vector, dtype, lmax, mmax, lmmax):
+        """Uneven shards, padded channels and masked high-bandlimit analysis."""
+        grid = th.as_grid(geometry, nlat=17, nlon=33)
+        serial = (th.RealVectorSHT if vector else th.RealSHT)(grid, lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device, dtype)
+        if mmax < self.grid_size_w:
+            # Existing distributed partitions require a nonempty order shard.
+            with self.assertRaises(RuntimeError):
+                (thd.DistributedRealVectorSHT if vector else thd.DistributedRealSHT)(grid, lmax=lmax, mmax=mmax, lmmax=lmmax)
+            return
+        distributed = (thd.DistributedRealVectorSHT if vector else thd.DistributedRealSHT)(grid, lmax=lmax, mmax=mmax, lmmax=lmmax).to(self.device, dtype)
+        self.assertTrue(distributed._extended_folded)
+        block = serial.weights[
+            ..., distributed.mmax_offset : distributed.mmax_offset + distributed.mmax_local, :, distributed.lat_offset : distributed.lat_offset + distributed.nlat_local
+        ]
+        torch.testing.assert_close(distributed.weights, block, atol=1e-13 if dtype == torch.float64 else 0, rtol=1e-13 if dtype == torch.float64 else 0)
+        self._check_distributed_sht(
+            17,
+            33,
+            lmax,
+            1,
+            1,
+            geometry,
+            vector,
+            1e-12 if dtype == torch.float64 else 1e-5,
+            1e-12 if dtype == torch.float64 else 1e-6,
+            mmax=mmax,
+            lmmax=lmmax,
+            dtype=dtype,
+            verbose=False,
+        )
+        # Independent analytic top-degree zonal scalar harmonic and its vector derivative.
+        # SciPy's recurrence supplies the spatial field; no shared synthesis is used.
+        import numpy as np
+        from scipy.special import eval_legendre, lpmv
+
+        l = lmax - 1
+        theta = grid.colats.numpy()
+        normalization = np.sqrt((2 * l + 1) / (4 * np.pi))
+        if vector:
+            field = normalization * lpmv(1, l, np.cos(theta))
+            spatial = torch.zeros(1, 1, 2, *grid.shape, device=self.device, dtype=dtype)
+            spatial[..., 0, :, :] = torch.tensor(field, device=self.device, dtype=dtype)[:, None]
+        else:
+            field = normalization * eval_legendre(l, np.cos(theta))
+            spatial = torch.tensor(field, device=self.device, dtype=dtype)[None, None, :, None].expand(1, 1, *grid.shape).contiguous()
+        from unittest.mock import patch
+
+        import torch_harmonics.distributed.distributed_sht as implementation
+
+        # Instrument the complete forward: exactly the existing two azimuth
+        # redistributions and one polar reduction, with no latitude gather.
+        with (
+            patch.object(implementation, "distributed_transpose_azimuth", wraps=implementation.distributed_transpose_azimuth) as transpose,
+            patch.object(implementation, "reduce_from_scatter_to_polar_region", wraps=implementation.reduce_from_scatter_to_polar_region) as reduction,
+        ):
+            local = distributed(self._split_helper(spatial))
+            self.assertEqual(transpose.call_count, 2 if self.grid_size_w > 1 else 0)
+            self.assertEqual(reduction.call_count, 1 if self.grid_size_h > 1 else 0)
+        actual = self._gather_helper_fwd(local, distributed)
+        expected = torch.zeros_like(actual)
+        if mmax and (lmmax is None or l < lmmax):
+            if vector:
+                expected[..., 0, l, 0] = 1
+            else:
+                expected[..., l, 0] = 1
+        ok = compare_tensors("analytic CC", expected, actual, atol=2e-6 if dtype == torch.float32 else 2e-13, rtol=0)
+        self.assertTrue(reduce_success(ok, self.device))
+        # A high global order exercises ranks whose interval starts away from zero,
+        # both continuation parities, and both spheroidal/toroidal conventions.
+        if mmax > 2:
+            from scipy.special import gammaln
+
+            m = mmax - 1
+            theta = theta[:, None]
+            phi = grid.lons().numpy()[None, :]
+            normalization *= np.exp(0.5 * (gammaln(l - m + 1) - gammaln(l + m + 1)))
+            p = normalization * lpmv(m, l, np.cos(theta))
+            harmonic = p * np.exp(1j * m * phi)
+            derivative = np.zeros_like(harmonic)
+            ring_slice = slice(None) if geometry == "fejer1" else slice(1, -1)
+            derivative[ring_slice] = (
+                (l * np.cos(theta[ring_slice]) * p[ring_slice] - (l + m) * normalization * lpmv(m, l - 1, np.cos(theta[ring_slice])))
+                / np.sin(theta[ring_slice])
+                * np.exp(1j * m * phi)
+            )
+            longitude = np.zeros_like(harmonic)
+            longitude[ring_slice] = 1j * m * harmonic[ring_slice] / np.sin(theta[ring_slice])
+            coefficient = 0.7 + 0.3j
+            for component in range(2) if vector else range(1):
+                basis = np.stack((derivative, longitude) if component == 0 else (longitude, -derivative)) if vector else harmonic
+                spatial = torch.tensor(2 * (coefficient * basis).real, device=self.device, dtype=dtype)[None, None]
+                actual = self._gather_helper_fwd(distributed(self._split_helper(spatial)), distributed)
+                expected = torch.zeros_like(actual)
+                if lmmax is None or l - m < lmmax:
+                    if vector:
+                        expected[..., component, l, m] = coefficient
+                    else:
+                        expected[..., l, m] = coefficient
+                ok = compare_tensors("high-order analytic CC", expected, actual, atol=2e-6 if dtype == torch.float32 else 2e-13, rtol=0)
+                self.assertTrue(reduce_success(ok, self.device))
 
     # Tolerances are atol=1e-5, rtol=1e-6, loosened from the near-exact agreement these rows
     # used to demand. The Legendre contraction is a distributed matmul: each polar rank
@@ -220,6 +334,9 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         skip_on_empty=True,
     )
     def test_distributed_sht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, verbose=True):
+        self._check_distributed_sht(nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax, lmmax, dtype, verbose)
+
+    def _check_distributed_sht(self, nlat, nlon, lmax, batch_size, num_chan, grid, vector, atol, rtol, mmax=None, lmmax=None, dtype=torch.float32, verbose=True):
 
         set_seed(333)
         mmax = lmax if mmax is None else mmax
@@ -265,6 +382,14 @@ class TestDistributedSphericalHarmonicTransform(unittest.TestCase):
         out_local = forward_transform_dist(inp_local)
         out_local.backward(ograd_local)
         igrad_local = inp_local.grad.clone()
+        if getattr(forward_transform_dist, "_extended_folded", False):
+            inp_local.grad = None
+            repeated = forward_transform_dist(inp_local)
+            repeated.backward(ograd_local, retain_graph=True)
+            torch.testing.assert_close(inp_local.grad, igrad_local, atol=0, rtol=0)
+            inp_local.grad = None
+            repeated.backward(ograd_local)
+            torch.testing.assert_close(inp_local.grad, igrad_local, atol=0, rtol=0)
 
         # Print diagnostics from rank 0 only; assert the all-reduced verdict on every
         # rank so a failure on any rank fails the test consistently (see reduce_success).

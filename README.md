@@ -252,6 +252,7 @@ losing orthogonality. Build one with `as_grid`:
 | grid type          | built with                                         | field shape    | accepted by                                              |
 | ------------------ | -------------------------------------------------- | -------------- | -------------------------------------------------------- |
 | `"equiangular"`    | `th.as_grid("equiangular", nlat=..., nlon=...)`    | `(nlat, nlon)` | every layer                                              |
+| `"fejer1"`         | `th.as_grid("fejer1", nlat=..., nlon=...)`         | `(nlat, nlon)` | every layer                                              |
 | `"legendre-gauss"` | `th.as_grid("legendre-gauss", nlat=..., nlon=...)` | `(nlat, nlon)` | every layer                                              |
 | `"lobatto"`        | `th.as_grid("lobatto", nlat=..., nlon=...)`        | `(nlat, nlon)` | every layer                                              |
 | `"trapezoidal"`    | `th.as_grid("trapezoidal", nlat=..., nlon=...)`    | `(nlat, nlon)` | every layer                                              |
