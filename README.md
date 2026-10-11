@@ -258,6 +258,12 @@ losing orthogonality. Build one with `as_grid`:
 | `"trapezoidal"`    | `th.as_grid("trapezoidal", nlat=..., nlon=...)`    | `(nlat, nlon)` | every layer                                              |
 | `"healpix"`        | `th.as_grid("healpix", nside=...)`                 | `(npix,)`      | `AttentionS2`, `NeighborhoodAttentionS2`, `QuadratureS2` |
 
+Equiangular and Fejér-1 grids use native quadrature at the default SHT
+truncation. Explicitly higher `lmax` bounds can use folded scalar and vector
+analysis, provided the latitude bound fits the grid and `mmax` excludes the
+even-longitude Nyquist order. See the [grid guide](docs/guide/grids.md) for
+the precise limits and memory costs.
+
 Layers that map between two grids take `grid_in` and `grid_out`, which need not
 be of the same type -- attention can decode from HEALPix onto a latitude-longitude
 grid, for instance:

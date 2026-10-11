@@ -272,10 +272,10 @@ class RealSHT(nn.Module):
     ``lmax <= nlat`` for Fejér-1) and ``mmax <= (nlon + 1) // 2``. These are
     the accurate band-limited recovery limits; the latter excludes the complex
     longitude Nyquist order when ``nlon`` is even. Oversized dimensions retain
-    legacy direct quadrature without implying accurate recovery. The default
-    truncation is unchanged. Extended analysis is intended for float32 and
-    float64; its latitude FFT has length ``2 * (nlat - 1)`` for equiangular
-    and ``2 * nlat`` for Fejér-1 grids.
+    legacy direct quadrature without implying accurate recovery. Defaults for
+    existing grid types are unchanged. Extended analysis is intended for
+    float32 and float64; its latitude FFT has length ``2 * (nlat - 1)`` for
+    equiangular and ``2 * nlat`` for Fejér-1 grids.
 
     .. seealso::
         :doc:`/guide/spherical_harmonic_transforms`
@@ -632,10 +632,10 @@ class RealVectorSHT(nn.Module):
     ``lmax <= nlat`` for Fejér-1) and ``mmax <= (nlon + 1) // 2``. These are
     the accurate band-limited recovery limits; the latter excludes the complex
     longitude Nyquist order when ``nlon`` is even. Oversized dimensions retain
-    legacy direct quadrature without implying accurate recovery. The default
-    truncation is unchanged. Extended analysis is intended for float32 and
-    float64; its latitude FFT has length ``2 * (nlat - 1)`` for equiangular
-    and ``2 * nlat`` for Fejér-1 grids.
+    legacy direct quadrature without implying accurate recovery. Defaults for
+    existing grid types are unchanged. Extended analysis is intended for
+    float32 and float64; its latitude FFT has length ``2 * (nlat - 1)`` for
+    equiangular and ``2 * nlat`` for Fejér-1 grids.
 
     .. seealso::
         :doc:`/guide/spherical_harmonic_transforms`
